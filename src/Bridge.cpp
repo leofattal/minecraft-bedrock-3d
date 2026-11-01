@@ -47,6 +47,8 @@ std::mutex g_mu;  // guards the strings + queues below
 std::condition_variable g_cv;
 std::string g_problem;
 std::string g_java_error;
+std::string g_info;  // newest diagnostics text for the helper
+bool g_info_dirty = false;
 
 struct SetupReq {
 	int gen = -1;
@@ -347,7 +349,7 @@ EGLBoolean h_eglSwapBuffersWithDamage(EGLDisplay dpy, EGLSurface surf, EGLint *r
 // ---- sender thread: Java/Binder side ----------------------------------------
 JavaVM *g_vm = nullptr;
 jclass g_cls = nullptr;
-jmethodID m_query = nullptr, m_setup = nullptr, m_frame = nullptr, m_err = nullptr;
+jmethodID m_query = nullptr, m_setup = nullptr, m_frame = nullptr, m_err = nullptr, m_info = nullptr;
 jclass g_hb_cls = nullptr;
 jmethodID m_hb_close = nullptr;
 
@@ -389,7 +391,8 @@ bool load_dex(JNIEnv *env)
 	m_setup = env->GetStaticMethodID(g_cls, "sendSetup", "(II[Landroid/hardware/HardwareBuffer;)Z");
 	m_frame = env->GetStaticMethodID(g_cls, "sendFrame", "(III)Z");
 	m_err = env->GetStaticMethodID(g_cls, "lastError", "()Ljava/lang/String;");
-	if (clear_exc(env) || !install || !m_query || !m_setup || !m_frame || !m_err) return false;
+	m_info = env->GetStaticMethodID(g_cls, "sendInfo", "(Ljava/lang/String;)Z");
+	if (clear_exc(env) || !install || !m_query || !m_setup || !m_frame || !m_err || !m_info) return false;
 	env->CallStaticVoidMethod(g_cls, install, app);
 	if (clear_exc(env)) return false;
 	g_hb_cls = (jclass)env->NewGlobalRef(env->FindClass("android/hardware/HardwareBuffer"));
@@ -498,6 +501,23 @@ void sender_main()
 				std::this_thread::sleep_for(std::chrono::milliseconds(250));
 			}
 		}
+		// 2b. Diagnostics for the helper's status box.
+		{
+			std::string info;
+			{
+				std::lock_guard<std::mutex> l(g_mu);
+				if (g_info_dirty) {
+					info = g_info;
+					g_info_dirty = false;
+				}
+			}
+			if (!info.empty() && g_connected) {
+				jstring js = env->NewStringUTF(info.c_str());
+				env->CallStaticBooleanMethod(g_cls, m_info, js);
+				clear_exc(env);
+				env->DeleteLocalRef(js);
+			}
+		}
 		// 3. Finished frames.
 		Job job{};
 		bool have = false;
@@ -552,6 +572,14 @@ void bridge_install_hooks()
 }
 
 void bridge_set_enabled(bool enabled) { g_enabled = enabled; }
+
+void bridge_post_info(const std::string &text)
+{
+	std::lock_guard<std::mutex> l(g_mu);
+	g_info = text;
+	g_info_dirty = true;
+	g_cv.notify_all();
+}
 
 std::vector<std::string> bridge_lines()
 {

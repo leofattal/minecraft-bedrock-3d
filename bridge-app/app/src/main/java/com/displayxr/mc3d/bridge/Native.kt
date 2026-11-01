@@ -29,6 +29,9 @@ object Native {
     /** Human-readable state for the app screen. */
     external fun statusText(): String
 
+    /** Show a built-in stereo test pattern instead of Minecraft. */
+    external fun setTestPattern(on: Boolean)
+
     /** True while eye pictures arrived in the last half second. */
     external fun receiving(): Boolean
 }

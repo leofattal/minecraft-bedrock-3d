@@ -18,7 +18,7 @@ import android.os.Parcel;
  */
 public final class BridgeReceiver extends BroadcastReceiver {
     public static final String ACTION_HELLO = "com.displayxr.mc3d.BRIDGE_HELLO";
-    private static final int TX_SETUP = 1, TX_FRAME = 2, TX_STATUS = 3;
+    private static final int TX_SETUP = 1, TX_FRAME = 2, TX_STATUS = 3, TX_INFO = 4;
 
     private static volatile IBinder sBinder;
     private static volatile int sGen;
@@ -91,6 +91,22 @@ public final class BridgeReceiver extends BroadcastReceiver {
             d.writeInt(eye);
             d.writeInt(seq);
             return b.transact(TX_FRAME, d, null, IBinder.FLAG_ONEWAY);
+        } catch (Throwable t) {
+            fail(b, t);
+            return false;
+        } finally {
+            d.recycle();
+        }
+    }
+
+    /** Mod diagnostics, shown in the helper's status box (on top of Minecraft). */
+    public static boolean sendInfo(String text) {
+        IBinder b = sBinder;
+        if (b == null) return false;
+        Parcel d = Parcel.obtain();
+        try {
+            d.writeString(text);
+            return b.transact(TX_INFO, d, null, IBinder.FLAG_ONEWAY);
         } catch (Throwable t) {
             fail(b, t);
             return false;

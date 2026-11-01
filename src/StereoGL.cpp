@@ -36,7 +36,7 @@ thread_local GLuint t_unit_tex[kUnits] = {};
 
 // ---- stats --------------------------------------------------------------------
 std::atomic<uint64_t> s_draws{0}, s_doubled{0}, s_proj{0}, s_targets{0}, s_fbos{0}, s_programs{0},
-    s_programs_cam{0}, s_fbo_fail{0};
+    s_programs_cam{0}, s_fbo_fail{0}, s_draw_win{0}, s_draw_mono{0}, s_blits{0}, s_blits_win{0}, s_frames{0};
 std::atomic<bool> s_hooks_ok{false};
 
 // ---- originals ------------------------------------------------------------------
@@ -75,6 +75,11 @@ GLFN(void, glDrawElements, GLenum, GLsizei, GLenum, const void *)
 GLFN(void, glDrawArraysInstanced, GLenum, GLint, GLsizei, GLsizei)
 GLFN(void, glDrawElementsInstanced, GLenum, GLsizei, GLenum, const void *, GLsizei)
 GLFN(void, glDrawRangeElements, GLenum, GLuint, GLuint, GLsizei, GLenum, const void *)
+GLFN(void, glDrawElementsBaseVertex, GLenum, GLsizei, GLenum, const void *, GLint)
+GLFN(void, glDrawRangeElementsBaseVertex, GLenum, GLuint, GLuint, GLsizei, GLenum, const void *, GLint)
+GLFN(void, glDrawElementsInstancedBaseVertex, GLenum, GLsizei, GLenum, const void *, GLsizei, GLint)
+GLFN(void, glDrawArraysIndirect, GLenum, const void *)
+GLFN(void, glDrawElementsIndirect, GLenum, GLenum, const void *)
 #undef GLFN
 
 // ============================ camera matrices ===================================
@@ -416,8 +421,12 @@ void stereo_draw(F &&draw)
 {
 	s_draws.fetch_add(1, std::memory_order_relaxed);
 	if (!active()) return draw();
+	if (t_draw_fbo == 0) s_draw_win.fetch_add(1, std::memory_order_relaxed);
 	const GLuint twin = twin_of(t_draw_fbo);
-	if (!twin) return draw();
+	if (!twin) {
+		s_draw_mono.fetch_add(1, std::memory_order_relaxed);
+		return draw();
+	}
 	draw();  // left eye: uniforms already hold the left camera
 
 	o_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, twin);
@@ -597,6 +606,8 @@ void h_glBlitFramebuffer(GLint a, GLint b, GLint c, GLint d, GLint e, GLint f, G
 {
 	o_glBlitFramebuffer(a, b, c, d, e, f, g, h, m, fl);
 	if (!active()) return;
+	s_blits.fetch_add(1, std::memory_order_relaxed);
+	if (t_draw_fbo == 0) s_blits_win.fetch_add(1, std::memory_order_relaxed);
 	const GLuint dt = twin_of(t_draw_fbo);
 	if (!dt) return;  // mono destination: the left eye is all it gets
 	const GLuint rt = twin_of(t_read_fbo);
@@ -689,6 +700,24 @@ void h_glDrawRangeElements(GLenum m, GLuint s, GLuint e, GLsizei c, GLenum t, co
 	stereo_draw([&] { o_glDrawRangeElements(m, s, e, c, t, i); });
 }
 
+void h_glDrawElementsBaseVertex(GLenum m, GLsizei c, GLenum t, const void *i, GLint bv)
+{
+	stereo_draw([&] { o_glDrawElementsBaseVertex(m, c, t, i, bv); });
+}
+void h_glDrawRangeElementsBaseVertex(GLenum m, GLuint s, GLuint e, GLsizei c, GLenum t, const void *i, GLint bv)
+{
+	stereo_draw([&] { o_glDrawRangeElementsBaseVertex(m, s, e, c, t, i, bv); });
+}
+void h_glDrawElementsInstancedBaseVertex(GLenum m, GLsizei c, GLenum t, const void *i, GLsizei n, GLint bv)
+{
+	stereo_draw([&] { o_glDrawElementsInstancedBaseVertex(m, c, t, i, n, bv); });
+}
+void h_glDrawArraysIndirect(GLenum m, const void *i) { stereo_draw([&] { o_glDrawArraysIndirect(m, i); }); }
+void h_glDrawElementsIndirect(GLenum m, GLenum t, const void *i)
+{
+	stereo_draw([&] { o_glDrawElementsIndirect(m, t, i); });
+}
+
 void destroy_window_twin()
 {
 	if (g_win_fbo) o_glDeleteFramebuffers(1, &g_win_fbo);
@@ -755,6 +784,9 @@ void stereo_install_hooks()
 	    HK(glBindRenderbuffer, true), HK(glDeleteRenderbuffers, true), HK(glRenderbufferStorage, true),
 	    HK(glRenderbufferStorageMultisample, true), HK(glDrawArrays, true), HK(glDrawElements, true),
 	    HK(glDrawArraysInstanced, true), HK(glDrawElementsInstanced, true), HK(glDrawRangeElements, true),
+	    HK(glDrawElementsBaseVertex, false), HK(glDrawRangeElementsBaseVertex, false),
+	    HK(glDrawElementsInstancedBaseVertex, false), HK(glDrawArraysIndirect, false),
+	    HK(glDrawElementsIndirect, false),
 	};
 #undef HK
 	bool ok = true;
@@ -784,6 +816,7 @@ void stereo_frame_boundary(bool on, int w, int h)
 		t_stereo = false;
 		return;
 	}
+	if (t_stereo) s_frames.fetch_add(1, std::memory_order_relaxed);
 	if (on && w > 0 && h > 0) {
 		t_stereo = ensure_window_twin(w, h);
 	} else {
@@ -802,6 +835,11 @@ StereoStats stereo_stats()
 	s.programs = s_programs.load();
 	s.programs_with_camera = s_programs_cam.load();
 	s.fbo_fail = s_fbo_fail.load();
+	s.draws_window = s_draw_win.load();
+	s.draws_mono = s_draw_mono.load();
+	s.blits = s_blits.load();
+	s.blits_window = s_blits_win.load();
+	s.stereo_frames = s_frames.load();
 	return s;
 }
 

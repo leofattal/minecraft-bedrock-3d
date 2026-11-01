@@ -103,6 +103,7 @@ std::atomic<int> g_buf_w{0}, g_buf_h{0};
 std::atomic<int> g_session_state{0};
 std::atomic<uint32_t> g_probe_px[2] = {{0}, {0}};  // centre pixel of the last left/right picture (RGBA)
 std::atomic<bool> g_probe_valid{false};
+std::atomic<bool> g_test_pattern{false};
 
 void set_stage(const char *s) {
   std::lock_guard<std::mutex> l(g_mu);
@@ -143,6 +144,9 @@ VkBuffer g_probe_buf = VK_NULL_HANDLE;  // 2 texels, host-visible: diagnostics
 VkDeviceMemory g_probe_mem = VK_NULL_HANDLE;
 void *g_probe_map = nullptr;
 uint32_t g_probe_tick = 0;
+VkBuffer g_pat_buf = VK_NULL_HANDLE;  // test pattern: two eye pictures, host-filled
+VkDeviceMemory g_pat_mem = VK_NULL_HANDLE;
+uint32_t g_pat_w = 0, g_pat_h = 0;
 bool g_have_foreign = false;
 PFN_vkGetAndroidHardwareBufferPropertiesANDROID g_vkGetAhbProps = nullptr;
 
@@ -846,11 +850,78 @@ void poll_events() {
   }
 }
 
+uint32_t host_mem_type(uint32_t bits) {
+  VkPhysicalDeviceMemoryProperties mp;
+  vkGetPhysicalDeviceMemoryProperties(g_vk_phys, &mp);
+  const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+    if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+  return UINT32_MAX;
+}
+
+void destroy_pattern() {
+  if (g_pat_buf) vkDestroyBuffer(g_vk_device, g_pat_buf, nullptr);
+  if (g_pat_mem) vkFreeMemory(g_vk_device, g_pat_mem, nullptr);
+  g_pat_buf = VK_NULL_HANDLE;
+  g_pat_mem = VK_NULL_HANDLE;
+  g_pat_w = g_pat_h = 0;
+}
+
+// Stereo test pattern: grey checkerboard at screen depth, a yellow square that
+// pops out of the screen, a red bar on the left eye's left edge and a blue bar
+// on the right eye's right edge (to check the eye order).
+bool ensure_pattern(uint32_t w, uint32_t h) {
+  if (g_pat_buf && g_pat_w == w && g_pat_h == h) return true;
+  vkDeviceWaitIdle(g_vk_device);
+  destroy_pattern();
+  VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = (VkDeviceSize)w * h * 4 * 2;
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  if (vkCreateBuffer(g_vk_device, &bci, nullptr, &g_pat_buf) != VK_SUCCESS) return false;
+  VkMemoryRequirements mr;
+  vkGetBufferMemoryRequirements(g_vk_device, g_pat_buf, &mr);
+  VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  mai.allocationSize = mr.size;
+  mai.memoryTypeIndex = host_mem_type(mr.memoryTypeBits);
+  void *map = nullptr;
+  if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g_vk_device, &mai, nullptr, &g_pat_mem) != VK_SUCCESS ||
+      vkBindBufferMemory(g_vk_device, g_pat_buf, g_pat_mem, 0) != VK_SUCCESS ||
+      vkMapMemory(g_vk_device, g_pat_mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+    destroy_pattern();
+    return false;
+  }
+  const bool bgr = g_swap_rb.load() != 0;
+  auto px = [bgr](uint8_t r, uint8_t g, uint8_t b) -> uint32_t {
+    if (bgr) std::swap(r, b);
+    return r | (g << 8) | (b << 16) | 0xFF000000u;
+  };
+  const int disparity = (int)w / 40;  // per eye, crossed: the square pops out
+  const int sq = (int)h / 3;
+  for (int eye = 0; eye < 2; ++eye) {
+    uint32_t *p = (uint32_t *)map + (size_t)eye * w * h;
+    const int sx = (int)w / 2 - sq / 2 + (eye == 0 ? disparity : -disparity);
+    const int sy = (int)h / 2 - sq / 2;
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x) {
+        uint32_t c = (((x / 80) + (y / 80)) & 1) ? px(90, 90, 90) : px(160, 160, 160);
+        if ((int)x >= sx && (int)x < sx + sq && (int)y >= sy && (int)y < sy + sq) c = px(250, 210, 30);
+        if (eye == 0 && x < w / 20) c = px(220, 30, 30);
+        if (eye == 1 && x >= w - w / 20) c = px(30, 60, 230);
+        p[(size_t)y * w + x] = c;
+      }
+  }
+  vkUnmapMemory(g_vk_device, g_pat_mem);
+  g_pat_w = w;
+  g_pat_h = h;
+  return true;
+}
+
 struct CopyJob {
   VkImage dst;
   uint32_t views, tw, th, cols;
   int src_idx[kMaxViews];
   bool probe;
+  bool pattern;
 };
 
 void rec_copy(VkCommandBuffer cb, void *user) {
@@ -902,6 +973,16 @@ void rec_copy(VkCommandBuffer cb, void *user) {
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
                        nullptr, 0, nullptr);
 
+  if (job->pattern) {
+    for (uint32_t v = 0; v < job->views; ++v) {
+      VkBufferImageCopy bc = {};
+      bc.bufferOffset = (VkDeviceSize)(v % 2) * g_pat_w * g_pat_h * 4;
+      bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      bc.imageOffset = {(int32_t)((v % job->cols) * job->tw), (int32_t)((v / job->cols) * job->th), 0};
+      bc.imageExtent = {g_pat_w, g_pat_h, 1};
+      vkCmdCopyBufferToImage(cb, g_pat_buf, job->dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    }
+  }
   const uint32_t cw = std::min(job->tw, g_bw), ch = std::min(job->th, g_bh);
   for (uint32_t v = 0; v < job->views; ++v) {
     int s = job->src_idx[v];
@@ -984,7 +1065,8 @@ void render_frame() {
   XrCompositionLayerProjectionView pv[kMaxViews] = {};
   uint32_t layer_views = submit;
   bool rendered = false;
-  const bool have_content = g_buf_count > 0 && (g_latest[0] >= 0 || g_latest[1] >= 0);
+  const bool pattern = g_test_pattern.load() && ensure_pattern(tw, th);
+  const bool have_content = pattern || (g_buf_count > 0 && (g_latest[0] >= 0 || g_latest[1] >= 0));
 
   if (fs.shouldRender && have_content) {
     XrViewState vs = {XR_TYPE_VIEW_STATE};
@@ -1018,7 +1100,10 @@ void render_frame() {
         if (l >= (int)g_buf_count) l = -1;
         if (rr >= (int)g_buf_count) rr = -1;
         for (uint32_t v = 0; v < submit; ++v) job.src_idx[v] = (v % 2 == 0) ? l : rr;
-        job.probe = (g_probe_tick++ % 30) == 0;
+        job.pattern = pattern;
+        if (pattern)
+          for (uint32_t v = 0; v < submit; ++v) job.src_idx[v] = -1;
+        job.probe = !pattern && (g_probe_tick++ % 30) == 0;
         one_shot(rec_copy, &job);
         if (job.probe && g_probe_map) {
           uint32_t px[2];
@@ -1081,6 +1166,7 @@ void destroy_all() {
   release_buffers();
   if (g_vk_device) {
     if (g_fence) vkDestroyFence(g_vk_device, g_fence, nullptr);
+    destroy_pattern();
     if (g_probe_buf) vkDestroyBuffer(g_vk_device, g_probe_buf, nullptr);
     if (g_probe_mem) vkFreeMemory(g_vk_device, g_probe_mem, nullptr);
     g_probe_buf = VK_NULL_HANDLE;
@@ -1242,7 +1328,12 @@ JNIEXPORT jintArray JNICALL Java_com_displayxr_mc3d_bridge_Native_status(JNIEnv 
 }
 
 JNIEXPORT jboolean JNICALL Java_com_displayxr_mc3d_bridge_Native_receiving(JNIEnv *, jobject) {
+  if (g_presenting.load() && g_test_pattern.load()) return JNI_TRUE;
   return (g_presenting.load() && now_ms() - g_last_frame_ms.load() < kReceivingWindowMs) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_com_displayxr_mc3d_bridge_Native_setTestPattern(JNIEnv *, jobject, jboolean on) {
+  g_test_pattern = on == JNI_TRUE;
 }
 
 JNIEXPORT jstring JNICALL Java_com_displayxr_mc3d_bridge_Native_statusText(JNIEnv *env, jobject) {
@@ -1271,6 +1362,7 @@ JNIEXPORT jstring JNICALL Java_com_displayxr_mc3d_bridge_Native_statusText(JNIEn
   snprintf(b, sizeof b, "Eye picture size: %dx%d%s\n", g_tile_w.load(), g_tile_h.load(),
            g_swap_rb.load() ? " (BGRA)" : "");
   s += b;
+  if (g_test_pattern.load()) s += "TEST PATTERN ON\n";
   if (g_buffer_count.load() == 0) {
     s += "Minecraft: not connected yet (start Minecraft with the mod)\n";
   } else {

@@ -20,6 +20,7 @@ import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
+import android.widget.TextView
 
 /**
  * Runs while 3D is on:
@@ -41,10 +42,30 @@ class BridgeService : Service() {
         const val TX_SETUP = 1
         const val TX_FRAME = 2
         const val TX_STATUS = 3
+        const val TX_INFO = 4
         const val PROTOCOL_VERSION = 1
         val LAUNCHERS = arrayOf("org.levimc.launcher", "org.levimc.launcher.dxr3d")
         @Volatile var running = false
         @Volatile var overlayAlpha = 0f
+        @Volatile var modInfo = ""
+        @Volatile var modInfoTime = 0L
+        @Volatile var shownMs = 0L
+        @Volatile var lastShownAt = 0L
+        @Volatile var testPattern = false
+        @Volatile var showStatusBox = true
+        fun statusText(): String {
+            val sb = StringBuilder()
+            sb.append(try { Native.statusText() } catch (t: Throwable) { "starting… ($t)\n" })
+            val now = android.os.SystemClock.uptimeMillis()
+            sb.append("3D layer over Minecraft: ").append(if (overlayAlpha > 0f) "SHOWN" else "hidden")
+            sb.append(" (shown ${shownMs / 1000} s in total")
+            if (lastShownAt > 0) sb.append(", last ${(now - lastShownAt) / 1000} s ago")
+            sb.append(")\n")
+            if (modInfo.isNotEmpty()) {
+                sb.append("— Mod (${(now - modInfoTime) / 1000} s ago) —\n").append(modInfo).append("\n")
+            }
+            return sb.toString()
+        }
     }
 
     private lateinit var wm: WindowManager
@@ -54,6 +75,20 @@ class BridgeService : Service() {
     private val location = IntArray(2)
     private var lastRect = IntArray(0)
     private var shownAlpha = -1f
+    private var lastFrameMs = 0L
+    private var statusView: TextView? = null
+
+    // Small status box on top of everything (also over Minecraft).
+    private val statusTick = object : Runnable {
+        override fun run() {
+            val v = statusView
+            if (v != null) {
+                v.text = statusText()
+                v.visibility = if (showStatusBox) android.view.View.VISIBLE else android.view.View.GONE
+            }
+            handler.postDelayed(this, 500)
+        }
+    }
 
     private val binder = object : Binder() {
         override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
@@ -71,6 +106,11 @@ class BridgeService : Service() {
                     }
                     TX_FRAME -> {
                         Native.frame(data.readInt(), data.readInt(), data.readInt())
+                        true
+                    }
+                    TX_INFO -> {
+                        modInfo = data.readString() ?: ""
+                        modInfoTime = android.os.SystemClock.uptimeMillis()
                         true
                     }
                     TX_STATUS -> {
@@ -111,6 +151,12 @@ class BridgeService : Service() {
         override fun doFrame(frameTimeNanos: Long) {
             if (!running) return
             sampleRect()
+            val now = android.os.SystemClock.uptimeMillis()
+            if (shownAlpha > 0f) {
+                if (lastFrameMs > 0) shownMs += now - lastFrameMs
+                lastShownAt = now
+            }
+            lastFrameMs = now
             val want = if (Native.receiving()) 0.8f else 0f
             if (want != shownAlpha) {
                 shownAlpha = want
@@ -133,7 +179,10 @@ class BridgeService : Service() {
         startInForeground()
         Native.start(applicationContext)
         addOverlay()
+        addStatusBox()
+        Native.setTestPattern(testPattern)
         handler.post(hello)
+        handler.post(statusTick)
         Choreographer.getInstance().postFrameCallback(frameCallback)
     }
 
@@ -145,6 +194,9 @@ class BridgeService : Service() {
         Choreographer.getInstance().removeFrameCallback(frameCallback)
         overlay?.let { try { wm.removeView(it) } catch (_: Throwable) {} }
         overlay = null
+        statusView?.let { try { wm.removeView(it) } catch (_: Throwable) {} }
+        statusView = null
+        overlayAlpha = 0f
         Native.setSurface(null)
         Native.stop()
         super.onDestroy()
@@ -197,6 +249,29 @@ class BridgeService : Service() {
         wm.addView(view, lp)
         overlay = view
         params = lp
+    }
+
+    private fun addStatusBox() {
+        val tv = TextView(this)
+        tv.textSize = 11f
+        tv.setTextColor(android.graphics.Color.WHITE)
+        tv.setBackgroundColor(0xC0000000.toInt())
+        tv.setPadding(16, 8, 16, 8)
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT,
+        )
+        lp.gravity = Gravity.BOTTOM or Gravity.START
+        lp.x = 12
+        lp.y = 12
+        lp.alpha = 0.8f
+        wm.addView(tv, lp)
+        statusView = tv
     }
 
     private fun sampleRect() {

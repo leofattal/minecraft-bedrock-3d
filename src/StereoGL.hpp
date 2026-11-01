@@ -39,7 +39,8 @@ bool stereo_frame_was_stereo();
 
 struct StereoStats {
 	uint64_t draws = 0, doubled = 0, proj_patches = 0, stereo_targets = 0, stereo_fbos = 0, programs = 0,
-	         programs_with_camera = 0, fbo_fail = 0;
+	         programs_with_camera = 0, fbo_fail = 0, draws_window = 0, draws_mono = 0, blits = 0, blits_window = 0,
+	         stereo_frames = 0;
 };
 StereoStats stereo_stats();
 

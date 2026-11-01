@@ -21,5 +21,6 @@ void bridge_start(JavaVM *vm);          // worker thread, once Minecraft is load
 void bridge_install_hooks();            // eglSwapBuffers
 void bridge_set_enabled(bool enabled);  // the ModMenu switch
 std::vector<std::string> bridge_lines();
+void bridge_post_info(const std::string &text);  // shown in the helper's status box
 
 } // namespace dxr3d

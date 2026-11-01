@@ -21,6 +21,8 @@ class MainActivity : Activity() {
     private lateinit var overlayBtn: Button
     private lateinit var cameraBtn: Button
     private lateinit var toggleBtn: Button
+    private lateinit var patternBtn: Button
+    private lateinit var boxBtn: Button
     private val handler = Handler(Looper.getMainLooper())
 
     private val refresh = object : Runnable {
@@ -65,6 +67,21 @@ class MainActivity : Activity() {
         root.addView(overlayBtn)
         root.addView(cameraBtn)
         root.addView(toggleBtn)
+        patternBtn = Button(this).apply {
+            setOnClickListener {
+                BridgeService.testPattern = !BridgeService.testPattern
+                if (BridgeService.running) Native.setTestPattern(BridgeService.testPattern)
+                update()
+            }
+        }
+        boxBtn = Button(this).apply {
+            setOnClickListener {
+                BridgeService.showStatusBox = !BridgeService.showStatusBox
+                update()
+            }
+        }
+        root.addView(patternBtn)
+        root.addView(boxBtn)
         status = label("", 14f).apply { gravity = Gravity.START }
         root.addView(status)
         setContentView(root)
@@ -105,9 +122,10 @@ class MainActivity : Activity() {
         overlayBtn.text = if (overlayOk) "1. Display over other apps: allowed ✓" else "1. Allow \"display over other apps\""
         cameraBtn.text = if (cameraOk) "2. Camera: allowed ✓" else "2. Allow camera (eye tracking)"
         toggleBtn.text = if (BridgeService.running) "Turn 3D OFF" else "3. Turn 3D ON"
+        patternBtn.text = if (BridgeService.testPattern) "Test pattern: ON (tap to stop)" else "Test pattern: off (tap to show a 3D test picture)"
+        boxBtn.text = if (BridgeService.showStatusBox) "Status box over Minecraft: ON" else "Status box over Minecraft: off"
         status.text = if (BridgeService.running) {
-            (try { Native.statusText() } catch (t: Throwable) { "starting… ($t)" }) +
-                "3D layer over Minecraft: " + (if (BridgeService.overlayAlpha > 0f) "SHOWN" else "hidden") + "\n"
+            BridgeService.statusText()
         } else {
             "3D is off."
         }

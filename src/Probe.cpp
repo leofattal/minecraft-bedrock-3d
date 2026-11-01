@@ -38,7 +38,7 @@ namespace {
 
 constexpr const char *kMinecraftLib = "libminecraftpe.so";
 constexpr const char *kModuleId = "displayxr3d.probe";
-constexpr const char *kVersion = "v0.5.1";
+constexpr const char *kVersion = "v0.5.2";
 JavaVM *g_vm = nullptr;
 
 using Clock = std::chrono::steady_clock;
@@ -64,6 +64,14 @@ std::vector<std::string> report_lines(const StereoStats &d, double dt)
 	              (unsigned long long)d.stereo_targets, (unsigned long long)d.stereo_fbos,
 	              (unsigned long long)d.fbo_fail, (unsigned long long)d.programs,
 	              (unsigned long long)d.programs_with_camera);
+	lines.emplace_back(buf);
+	const double fr = (d.stereo_frames - last.stereo_frames) > 0 ? double(d.stereo_frames - last.stereo_frames) : 1.0;
+	std::snprintf(buf, sizeof(buf),
+	              "Per stereo frame (%.0f/s): draws %.0f, doubled %.0f, single (no right-eye target) %.0f, to window %.0f, blits %.0f (to window %.0f)",
+	              (d.stereo_frames - last.stereo_frames) / dt, (d.draws - last.draws) / fr,
+	              (d.doubled - last.doubled) / fr, (d.draws_mono - last.draws_mono) / fr,
+	              (d.draws_window - last.draws_window) / fr, (d.blits - last.blits) / fr,
+	              (d.blits_window - last.blits_window) / fr);
 	lines.emplace_back(buf);
 	last = d;
 	for (auto &l : bridge_lines()) lines.push_back(l);
@@ -143,6 +151,11 @@ void worker()
 		const auto lines = report_lines(stereo_stats(), dt);
 		if (!g_module_registered && (tick % 10) == 0) register_module();
 		if (g_panel.load()) submit_panel(lines);
+		{
+			std::string info;
+			for (size_t i = 1; i < lines.size() && i + 1 < lines.size(); ++i) info += lines[i] + "\n";
+			bridge_post_info(info);
+		}
 		if ((tick % 20) == 0)
 			for (const auto &l : lines) LOGI("%s", l.c_str());
 		++tick;
