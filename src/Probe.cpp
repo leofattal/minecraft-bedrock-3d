@@ -16,6 +16,7 @@
 // Uniform names (u_proj / PROJ) follow BedrockTools' motion blur module
 // (https://github.com/QYCottage/BedrockTools, MIT, (c) 2026 RadiantByte).
 #include "Probe.hpp"
+#include "Bridge.hpp"
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -47,19 +48,14 @@ namespace {
 
 constexpr const char *kMinecraftLib = "libminecraftpe.so";
 constexpr const char *kModuleId = "displayxr3d.probe";
-constexpr const char *kVersion = "v0.3.0";
+constexpr const char *kVersion = "v0.4.0";
 JavaVM *g_vm = nullptr;
-std::mutex g_android_mu;
-AndroidReport g_android;
 
-constexpr float kWobbleBlocks = 0.30f;   // eye offset for the wobble demo
-constexpr float kConvergence = 4.0f;     // blocks; this distance stays still
-constexpr int kWobbleHalfPeriodMs = 500;
+constexpr float kConvergence = 3.0f;     // blocks; this distance sits at the screen
 
 using Clock = std::chrono::steady_clock;
 
 std::atomic<bool> g_started{false};
-std::atomic<bool> g_wobble{true};
 std::atomic<bool> g_panel{true};
 
 // ---- GL hooks ---------------------------------------------------------------
@@ -101,7 +97,6 @@ std::set<std::string> g_matrix_names;  // every mat4 / vec4[4] uniform name seen
 std::string g_gl_version = "not seen yet";
 std::string g_gl_renderer;
 
-std::atomic<float> g_eye_x{0.0f};  // current eye offset in blocks (render thread reads)
 
 bool is_proj_name(const std::string &n)
 {
@@ -284,57 +279,17 @@ void install_gl_hooks()
 
 // ---- Panel -------------------------------------------------------------------
 
-std::vector<std::string> report_lines(double fps, double proj_s, double comb_s)
+std::vector<std::string> report_lines(double proj_s)
 {
 	std::vector<std::string> lines;
 	char buf[300];
-	std::snprintf(buf, sizeof(buf), "DisplayXR 3D - TEST 3 (DisplayXR access)  %s", kVersion);
+	std::snprintf(buf, sizeof(buf), "DisplayXR 3D - TEST 4 (3D through the helper app)  %s", kVersion);
 	lines.emplace_back(buf);
-	std::snprintf(buf, sizeof(buf), "A) GL hooks: program %s  link %s  matrix %s  vec4 %s  clear %s",
-	              g_hooked[0] ? "ok" : "FAIL", g_hooked[1] ? "ok" : "FAIL", g_hooked[2] ? "ok" : "FAIL",
-	              g_hooked[3] ? "ok" : "FAIL", g_hooked[4] ? "ok" : "FAIL");
+	std::snprintf(buf, sizeof(buf), "Camera hooks: program %s  matrix %s  vec4 %s   camera changes/s %.0f",
+	              g_hooked[0] ? "ok" : "FAIL", g_hooked[2] ? "ok" : "FAIL", g_hooked[3] ? "ok" : "FAIL", proj_s);
 	lines.emplace_back(buf);
-	std::snprintf(buf, sizeof(buf), "B) Frames/s %.0f   projection changes/s %.0f   combined changes/s %.0f",
-	              fps, proj_s, comb_s);
-	lines.emplace_back(buf);
-	std::snprintf(buf, sizeof(buf), "   Shaders seen %llu, with a 3D camera matrix %llu",
-	              (unsigned long long)g_programs_seen.load(),
-	              (unsigned long long)g_programs_with_targets.load());
-	lines.emplace_back(buf);
-	{
-		std::lock_guard<std::mutex> lock(g_info_mu);
-		std::string names = "C) Matrices: ";
-		for (const auto &n : g_matrix_names) {
-			if (names.size() > 150) {
-				names += "...";
-				break;
-			}
-			names += n + " ";
-		}
-		lines.push_back(names);
-		std::snprintf(buf, sizeof(buf), "   GPU: %.60s", g_gl_version.c_str());
-		lines.emplace_back(buf);
-	}
-	{
-		std::lock_guard<std::mutex> lock(g_android_mu);
-		const AndroidReport &a = g_android;
-		const char *yn[2] = {"no", "YES"};
-		if (!a.done) {
-			lines.emplace_back("D) DisplayXR check: running...");
-		} else {
-			std::snprintf(buf, sizeof(buf), "D) App %s  %s", a.package_name, a.error);
-			lines.emplace_back(buf);
-			std::snprintf(buf, sizeof(buf), "   DisplayXR runtime visible: %s  broker %s  runtime services %d",
-			              yn[a.runtime_out_of_process || a.runtime_in_process], yn[a.broker_provider], a.runtime_services);
-			lines.emplace_back(buf);
-			std::snprintf(buf, sizeof(buf), "   Leia display %s  head tracking %s  camera permission %s",
-			              yn[a.leia_display_config], yn[a.leia_head_tracking], yn[a.perm_camera]);
-			lines.emplace_back(buf);
-		}
-	}
-	lines.emplace_back(g_wobble.load() ? "Wobble ON: the world should jump left/right twice a second"
-	                                   : "Wobble OFF");
-	lines.emplace_back("Please send a screenshot, and say if the world wobbles.");
+	for (auto &l : bridge_lines()) lines.push_back(l);
+	lines.emplace_back("Hide this panel: mod menu > DisplayXR 3D > off (also turns 3D off).");
 	return lines;
 }
 
@@ -344,15 +299,14 @@ void register_module()
 {
 	pl::modmenu::ModuleInfo info;
 	info.moduleId = kModuleId;
-	info.displayName = "DisplayXR 3D test";
-	info.description = "Test 2: stereo eye offset (world wobbles left/right)";
+	info.displayName = "DisplayXR 3D";
+	info.description = "Glasses-free 3D through the DisplayXR 3D Bridge app";
 	info.modId = "displayxr3d";
 	info.defaultEnabled = true;
 	info.onToggle = [](std::string_view, bool enabled) {
-		g_wobble.store(enabled);
+		bridge_set_enabled(enabled);
 		g_panel.store(enabled);
 		if (!enabled) {
-			g_eye_x.store(0.0f);
 			pl::modmenu::submitDrawCommands(kModuleId, {});
 		}
 	};
@@ -396,38 +350,25 @@ void worker()
 		usleep(200 * 1000);
 	}
 	install_gl_hooks();
+	bridge_install_hooks();
+	bridge_start(g_vm);
 	std::this_thread::sleep_for(std::chrono::seconds(4));
 	register_module();
-	{
-		AndroidReport r;
-		run_android_probe(g_vm, r);
-		std::lock_guard<std::mutex> lock(g_android_mu);
-		g_android = r;
-	}
 
-	uint64_t last_f = g_frames.load(), last_p = g_mod_proj.load(), last_c = g_mod_combined.load();
+	uint64_t last_p = g_mod_proj.load() + g_mod_combined.load();
 	auto last_t = Clock::now();
 	int tick = 0;
 	for (;;) {
-		// Update the eye offset often so the switch is crisp.
-		for (int i = 0; i < 10; ++i) {
-			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-			                    Clock::now().time_since_epoch()).count();
-			const float side = ((ms / kWobbleHalfPeriodMs) & 1) ? 1.0f : -1.0f;
-			g_eye_x.store(g_wobble.load() ? side * kWobbleBlocks : 0.0f);
-			std::this_thread::sleep_for(std::chrono::milliseconds(50));
-		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
 		const auto now = Clock::now();
 		const double dt = std::chrono::duration<double>(now - last_t).count();
-		const uint64_t f = g_frames.load(), p = g_mod_proj.load(), c = g_mod_combined.load();
-		const auto lines = report_lines((f - last_f) / dt, (p - last_p) / dt, (c - last_c) / dt);
-		last_f = f;
+		const uint64_t p = g_mod_proj.load() + g_mod_combined.load();
+		const auto lines = report_lines((p - last_p) / dt);
 		last_p = p;
-		last_c = c;
 		last_t = now;
 		if (!g_module_registered && (tick % 10) == 0) register_module();
 		if (g_panel.load()) submit_panel(lines);
-		if ((tick % 10) == 0)
+		if ((tick % 20) == 0)
 			for (const auto &l : lines) LOGI("%s", l.c_str());
 		++tick;
 	}
@@ -439,14 +380,14 @@ void probe_load(JavaVM *vm, const std::filesystem::path &) { g_vm = vm; }
 
 void probe_enable()
 {
-	g_wobble.store(true);
+	bridge_set_enabled(true);
 	g_panel.store(true);
 	if (!g_started.exchange(true)) std::thread(worker).detach();
 }
 
 void probe_disable()
 {
-	g_wobble.store(false);
+	bridge_set_enabled(false);
 	g_panel.store(false);
 	g_eye_x.store(0.0f);
 }

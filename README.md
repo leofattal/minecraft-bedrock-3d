@@ -3,6 +3,21 @@
 A LeviLauncher native mod for Minecraft Bedrock **1.26.60** on Android. The goal is glasses-free
 stereo 3D on the Leia Lume Pad 2 through the [DisplayXR](https://github.com/DisplayXR) runtime.
 
+## Test 4 (v0.4.0): 3D through the helper app
+
+Two parts:
+
+- `displayxr3d-0.4.0.levipack`: the Minecraft mod. Every frame it copies Minecraft's picture into
+  shared GPU buffers (AHardwareBuffer). Frames alternate between the left and right eye.
+- `DisplayXR-3D-Bridge.apk` (source in `bridge-app/`): a helper app. It receives the eye pictures
+  over Binder, gives them to DisplayXR through OpenXR, and shows DisplayXR's woven 3D image in a
+  click-through overlay above Minecraft.
+
+The helper is needed because LeviLauncher can't see the DisplayXR runtime (Android package
+visibility). Android also blocks unix sockets between apps (SELinux MLS), so the two parts talk over
+Binder. The mod's Binder client is a small Java class (`java/`). `tools/build_dex.sh` compiles it into
+`src/BridgeDex.inc`, and it is loaded with InMemoryDexClassLoader.
+
 ## Status: Test 2 (eye offset)
 
 Test 1 found Minecraft's code and showed the tablet's GPU can share images with Vulkan. It also

@@ -11,7 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(MOD_ID "displayxr3d")
-set(MOD_NAME "DisplayXR 3D (test)")
+set(MOD_NAME "DisplayXR 3D")
 set(MOD_AUTHOR "displayxr3d")
 set(MOD_VERSION "0.3.0" CACHE STRING "Mod version")
 set(MOD_LIBRARY_NAME "displayxr3d")
@@ -47,11 +47,12 @@ add_library(${MOD_LIBRARY_NAME} SHARED
     src/main.cpp
     src/Probe.cpp
     src/AndroidProbe.cpp
+    src/Bridge.cpp
 )
 target_include_directories(${MOD_LIBRARY_NAME} PRIVATE src "${preloader_android_SOURCE_DIR}/include")
 target_compile_options(${MOD_LIBRARY_NAME} PRIVATE -Os -ffunction-sections -fdata-sections -fvisibility=hidden -fvisibility-inlines-hidden -Wall)
 target_link_options(${MOD_LIBRARY_NAME} PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,--gc-sections" "-Wl,--icf=all")
-target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE preloader log EGL GLESv3 dl fmt::fmt)
+target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE preloader log EGL GLESv3 android nativewindow dl fmt::fmt)
 
 add_custom_command(TARGET ${MOD_LIBRARY_NAME} POST_BUILD
     COMMAND "${CMAKE_STRIP}" --strip-unneeded "$<TARGET_FILE:${MOD_LIBRARY_NAME}>"

@@ -1,0 +1,236 @@
+// Copyright 2026, DisplayXR
+// SPDX-License-Identifier: Apache-2.0
+//
+// PROVISIONAL — DXR is DisplayXR's Khronos-registered OpenXR author ID, but
+// the XR_DXR_* extensions in this header are NOT yet registered in the
+// Khronos OpenXR registry: extension numbers and XrStructureType values sit
+// in a provisional experimental block (1004999xxx) pending official
+// assignment. Extension names are expected to be stable; numeric values are
+// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
+// interface history did not restart with the name).
+// See GOVERNANCE.md in https://github.com/DisplayXR/displayxr-extensions.
+//
+/*!
+ * @file
+ * @brief  Header for XR_DXR_view_rig extension
+ * @author David Fattal
+ * @ingroup external_openxr
+ *
+ * App-facing control of the runtime's view-rig math: the app chains a rig
+ * descriptor (the handful of Kooima tunables) onto xrLocateViews and consumes
+ * standard XrView{pose, fov} — render-ready, clip-independent — instead of
+ * re-implementing the view math from raw eye positions. A separate raw-result
+ * struct exposes the complete rig inputs (display-space eyes, display plane,
+ * canvas rect, sample time, tracking lock) for aware consumers that keep doing
+ * their own math (e.g. a present-owning browser).
+ *
+ * Two rigs exist, matching the two canonical pipelines:
+ *  - display rig (display-centric): the window/canvas is a portal into the
+ *    scene; tunables = virtual display height (m2v scale), ipd factor,
+ *    parallax factor, perspective factor.
+ *  - camera rig (camera-centric): an app-defined camera whose frustum eye
+ *    tracking perturbs; tunables = ipd factor, parallax factor, convergence,
+ *    vertical FOV.
+ *
+ * Descriptors carry NO clip parameters (fov is clip-independent — near/far and
+ * depth convention stay app-side) and NO placement parameters (the runtime owns
+ * the window/canvas geometry). The rig is strictly per-locate: chain a
+ * descriptor on every xrLocateViews you want it to drive (animating
+ * convergence or virtual display height is just passing different values next
+ * frame), and a locate that chains nothing keeps the default behavior —
+ * including the raw-eye transport in XrView.pose for external-window apps.
+ *
+ * Rig-scoped hand joints (spec 4): the SAME descriptor may be chained on
+ * XrHandJointsLocateInfoEXT::next (XR_EXT_hand_tracking). The runtime then
+ * returns the joints in the rig frame — exactly the transform the views get for
+ * that descriptor: display rig: display-space metres -> app units by
+ * virtualDisplayHeight / the session's resolved canvas height, times
+ * perspectiveFactor, placed at the rig pose; camera rig: metersToVirtual about
+ * the nominal viewer plane, placed at the camera pose. Joint radii and linear
+ * velocities scale by the same factor; orientations and angular velocities are
+ * rotated into the rig frame. The eye-pair tunables (ipdFactor, parallaxFactor)
+ * and the camera frustum (convergence, vertical FOV) do not move a point and do
+ * not apply. The canvas is the one the session's most recent xrLocateViews
+ * resolved (in service mode, the one the service resolved for it), so joints
+ * are consistent with the latest views; chain the same descriptor on both. The
+ * rig pose is taken in XrHandJointsLocateInfoEXT::baseSpace. A locate that
+ * chains nothing returns base-space metres, as before.
+ *
+ * The app-facing halves are pure next-chain structs on xrLocateViews. The one
+ * entry point, xrSetWorkspaceViewRigDXR, is for the workspace controller only:
+ * an app's own rig is honored by default (app visual policy within its canvas),
+ * but in workspace mode the controller may take over the clients' view geometry
+ * through this call (e.g. forcing identity m2v during a layout animation). Full
+ * design: docs/adr/ADR-024-raw-vs-render-ready-views.md (W7 of issue #396).
+ */
+#ifndef XR_DXR_VIEW_RIG_H
+#define XR_DXR_VIEW_RIG_H 1
+
+#include <openxr/openxr.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define XR_DXR_view_rig 1
+// Spec 4 (#2189): the rig descriptors are also valid on
+// XrHandJointsLocateInfoEXT::next — joints are returned in the rig frame.
+#define XR_DXR_view_rig_SPEC_VERSION 4
+#define XR_DXR_VIEW_RIG_EXTENSION_NAME "XR_DXR_view_rig"
+
+// Reserved 1004999xxx range, next free block after mcp_tools (…130-132).
+// Final values reconcile with the Khronos registry before spec freeze.
+#define XR_TYPE_DISPLAY_RIG_DXR      ((XrStructureType)1004999140)
+#define XR_TYPE_CAMERA_RIG_DXR       ((XrStructureType)1004999141)
+#define XR_TYPE_VIEW_DISPLAY_RAW_DXR ((XrStructureType)1004999142)
+
+//! Capacity of XrViewDisplayRawDXR::rawEyes (matches the runtime's max views).
+#define XR_VIEW_RIG_MAX_RAW_EYES_DXR 8
+
+// ---- Request: chain exactly ONE of these on XrViewLocateInfo::next ----
+// ---- (spec 4: or on XrHandJointsLocateInfoEXT::next, for rig-frame joints). ----
+
+/*!
+ * @brief Display-centric rig: the window/canvas is a portal into the scene.
+ *
+ * Maps 1:1 onto the runtime's display-rig tunables. Out-of-range values are
+ * clamped (with a one-shot runtime WARN), never rejected.
+ */
+typedef struct XrDisplayRigDXR {
+    XrStructureType          type;   //!< Must be XR_TYPE_DISPLAY_RIG_DXR
+    const void* XR_MAY_ALIAS next;
+    XrPosef pose;                  //!< virtual display plane pose in the locate space
+    float   virtualDisplayHeight;  //!< app units; m2v = this / physical canvas height
+    float   ipdFactor;             //!< [0,1] multiplies view-pose spread about the center
+    float   parallaxFactor;        //!< [0,1] lerps eye centroid toward nominal viewer
+    float   perspectiveFactor;     //!< [0.1,10] scales eye XYZ (object perspective)
+} XrDisplayRigDXR;
+
+/*!
+ * @brief Camera-centric rig: an app camera whose frustum eye tracking perturbs.
+ *
+ * Maps 1:1 onto the runtime's camera-rig tunables (convergenceDiopters is the
+ * inverse convergence distance the math consumes; verticalFov converts to
+ * half-tan at the boundary). Out-of-range values are clamped (one-shot WARN),
+ * never rejected.
+ *
+ * metersToVirtual (spec v3) scales tracked head motion (meters) into the app's
+ * world units in the modelview; with it, convergenceDiopters is the inverse
+ * convergence distance in WORLD units (it reduces to 1/m when
+ * metersToVirtual == 1). 0 (or unset) is treated as 1.0, preserving the
+ * pre-v3 behavior where one world unit was implicitly one meter.
+ *
+ * Effective gain (#2422). The rig's angle and disparity gain over the physical
+ * window is one number:
+ *
+ *     f = metersToVirtual * convergenceDiopters * N
+ *
+ * where N is the nominal viewer distance the display reports (meters). The eye
+ * the display reports (tracked, or its nominal viewer) is taken relative to the
+ * canvas centre; its x/y offset (meters) is multiplied by metersToVirtual and
+ * placed in the camera frame, and the frustum is sheared by that offset times
+ * convergenceDiopters. An eye y meters off the canvas axis therefore sees the
+ * frustum centre turned by atan(f * y / N), against the physical atan(y / N).
+ * f == 1 is angle-true (a viewer offset keeps its physical angle, and disparity
+ * matches the physical window); f > 1 multiplies head-motion parallax and
+ * disparity by f.
+ *
+ * verticalFov only sets the base frustum half-tangent, tan(verticalFov / 2). It
+ * is never a scale: it does not enter f and does not size anything the eye
+ * moves through. Choose metersToVirtual from the convergence distance, not
+ * from the framing:
+ *
+ *     metersToVirtual = 1 / (convergenceDiopters * N)     (angle-true, f == 1)
+ *
+ * Setting metersToVirtual to the framing scale at the convergence plane,
+ * 2 * tan(verticalFov / 2) / (convergenceDiopters * canvas height), gives
+ * f = tan(verticalFov / 2) / tan(canvas vFOV / 2), which is why a wide app
+ * vFOV on a small window appears to lift the eyes.
+ *
+ * The axis is the canvas normal through the canvas centre, not the viewer. A
+ * nominal viewer y meters above the window centre (most displays report one)
+ * sits metersToVirtual * y world units above the camera pose and looks at the
+ * frame centre atan(f * y / N) below the camera axis, even at f == 1 (there the
+ * angle is the true viewing angle). An app that wants the nominal eye ON its
+ * camera axis should chain XrDisplayRigDXR instead: pose at the glass point
+ * (the camera pose moved 1 / convergenceDiopters along its forward axis),
+ * oriented as the camera pitched up by atan(viewerY / viewerZ) about its local
+ * X axis; virtualDisplayHeight = 2 * tan(verticalFov / 2) / convergenceDiopters
+ * (the frustum height at that plane); ipdFactor, parallaxFactor and
+ * perspectiveFactor = 1. viewerY / viewerZ is the nominal eye relative to the
+ * canvas centre (XrViewDisplayRawDXR, canvas-rebased). Worked example:
+ * docs/specs/extensions/XR_DXR_view_rig.md.
+ */
+typedef struct XrCameraRigDXR {
+    XrStructureType          type;   //!< Must be XR_TYPE_CAMERA_RIG_DXR
+    const void* XR_MAY_ALIAS next;
+    XrPosef pose;                  //!< camera pose in the locate space; the canvas-centre eye
+                                   //!< (0, 0, N) maps here, NOT the nominal viewer
+    float   ipdFactor;             //!< ABSOLUTE eye-separation scale (>= 0; any positive — a stereo
+                                   //!< camera's inter-axial is not bounded to natural IPD). NOT the
+                                   //!< display rig's relative [0,1] factor. Divergence comfort is
+                                   //!< guarded on convergence, not by bounding this.
+    float   parallaxFactor;        //!< ABSOLUTE parallax scale (>= 0); not the [0,1] display factor
+    float   convergenceDiopters;   //!< 1/(convergence distance in world units); 0 = infinity
+    float   verticalFov;           //!< radians, full vertical angle; sets the base frustum
+                                   //!< half-tangent only, never a scale (does not enter f)
+    float   metersToVirtual;       //!< meters→world scale on the eye; 0/unset = 1.0 (spec v3).
+                                   //!< Gain f = metersToVirtual * convergenceDiopters * N;
+                                   //!< 1 / (convergenceDiopters * N) is angle-true (f == 1)
+} XrCameraRigDXR;
+
+// ---- Result: app chains this on XrViewState::next; runtime fills it. ----
+
+/*!
+ * @brief Raw rig inputs for the locate, filled by the runtime.
+ *
+ * The complete input set the rigs consume, untransformed: per-view eye
+ * positions verbatim in physical display space (NOT canvas-rebased — apply
+ * the canvas rect yourself, e.g. via display3d_resolve_window_rect), the
+ * display-plane pose, the effective canvas the runtime resolved for this
+ * session, the eye-sample timestamp and the physical tracker lock. Reported
+ * eyes are the DP's full per-view set verbatim — one eye per active view
+ * (the display processor owns multi-view fill: e.g. it reports N eyes for an
+ * N-view mode; the runtime never synthesizes eyes). When the tracker has no
+ * lock the runtime still reports nominal-viewer eyes with isTracking = XR_FALSE.
+ */
+typedef struct XrViewDisplayRawDXR {
+    XrStructureType    type;       //!< Must be XR_TYPE_VIEW_DISPLAY_RAW_DXR
+    void* XR_MAY_ALIAS next;
+    XrVector3f  rawEyes[XR_VIEW_RIG_MAX_RAW_EYES_DXR]; //!< display-space eye positions (meters,
+                                   //!< display-center origin, +X right +Y up +Z toward viewer)
+    uint32_t    eyeCountOutput;    //!< eyes written = the DP's per-view count
+                                   //!< for this locate (one per active view)
+    XrPosef     displayPlanePose;  //!< physical display plane in the locate space
+    XrRect2Di   canvasRectPx;      //!< effective canvas on the panel (window client
+                                   //!< area / texture sub-rect / runtime window)
+    XrExtent2Df canvasSizeMeters;  //!< physical size of that canvas
+    int64_t     sampleTimeNs;      //!< when the eyes were sampled (monotonic)
+    XrBool32    isTracking;        //!< physical tracker lock (vs nominal fallback)
+} XrViewDisplayRawDXR;
+
+// ---- Entry point: workspace controller only. ----
+
+// Impose a view rig on the workspace's app clients (or clear it). By default an
+// app's own rig is honored within its canvas; while an override is set here, the
+// runtime applies THIS rig to the clients' locates instead — the controller
+// takes over view geometry (e.g. forcing identity m2v during a layout animation).
+//
+//   session — the active workspace controller's session (else
+//             XR_ERROR_VALIDATION_FAILURE).
+//   rig     — NULL, or an XrDisplayRigDXR / XrCameraRigDXR (its `type` selects
+//             which); NULL clears the override so clients fall back to honoring
+//             their own rigs. Out-of-range tunables are clamped.
+//
+// Per-call, not chained: the override stays in effect until changed or cleared.
+typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigDXR)(XrSession session, const void *rig);
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceViewRigDXR(XrSession session, const void *rig);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // XR_DXR_VIEW_RIG_H
