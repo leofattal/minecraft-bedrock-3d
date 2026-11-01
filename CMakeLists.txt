@@ -48,6 +48,7 @@ add_library(${MOD_LIBRARY_NAME} SHARED
     src/Probe.cpp
     src/AndroidProbe.cpp
     src/Bridge.cpp
+    src/StereoGL.cpp
 )
 target_include_directories(${MOD_LIBRARY_NAME} PRIVATE src "${preloader_android_SOURCE_DIR}/include")
 target_compile_options(${MOD_LIBRARY_NAME} PRIVATE -Os -ffunction-sections -fdata-sections -fvisibility=hidden -fvisibility-inlines-hidden -Wall)

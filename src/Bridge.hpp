@@ -1,9 +1,9 @@
 // Link to the "DisplayXR 3D Bridge" helper app.
 //
-// Each finished Minecraft frame (eglSwapBuffers) is copied, scaled and flipped
-// into one of a ring of AHardwareBuffers shared with the helper over Binder.
-// Frames alternate between the left and the right eye (frame-sequential
-// stereo); the helper hands the newest left + right pair to DisplayXR, which
+// Every Minecraft frame is rendered for both eyes (StereoGL). At
+// eglSwapBuffers the left eye (the window) and the right eye (its twin) are
+// copied, scaled and flipped into a ring of AHardwareBuffers shared with the
+// helper over Binder; the helper hands each pair to DisplayXR, which
 // weaves them for the Lume Pad's 3D panel and draws them in an overlay window
 // above Minecraft. While that happens, Minecraft's own frame is cleared to
 // black so it does not show through the overlay.
@@ -16,9 +16,6 @@
 #include <vector>
 
 namespace dxr3d {
-
-// Eye offset (blocks) the matrix hooks apply to the frame being rendered.
-extern std::atomic<float> g_eye_x;
 
 void bridge_start(JavaVM *vm);          // worker thread, once Minecraft is loaded
 void bridge_install_hooks();            // eglSwapBuffers

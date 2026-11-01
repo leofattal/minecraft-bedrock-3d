@@ -1,4 +1,5 @@
 #include "Bridge.hpp"
+#include "StereoGL.hpp"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -24,14 +25,11 @@
 
 namespace dxr3d {
 
-std::atomic<float> g_eye_x{0.0f};
-
 namespace {
 
 #include "BridgeDex.inc"
 
-constexpr int kSlots = 6;
-constexpr float kHalfIpd = 0.05f;  // blocks each eye sits left/right of the player camera
+constexpr int kSlots = 6;  // 3 left/right pairs
 
 using Clock = std::chrono::steady_clock;
 
@@ -59,7 +57,7 @@ SetupReq g_setup_pending;  // newest ring, waiting to be sent
 bool g_setup_dirty = false;
 
 struct Job {
-	int gen, slot, eye, seq;
+	int gen, slot_l, slot_r, seq;
 	EGLSyncKHR sync;
 };
 std::deque<Job> g_jobs;
@@ -105,7 +103,6 @@ int g_ring_w = 0, g_ring_h = 0;
 bool g_ring_failed = false;
 GLuint g_mid_tex = 0, g_mid_fbo = 0;  // resolve target for a multisampled window
 int g_mid_w = 0, g_mid_h = 0;
-int g_frame_eye = 0;  // eye the current frame is being rendered for
 int g_seq = 0;
 bool g_stereo_active = false;
 
@@ -208,15 +205,31 @@ bool ensure_mid(int w, int h)
 	return ok;
 }
 
-// Copy the finished window picture into ring slot `slot` (scaled, flipped so
-// row 0 is the top, as Vulkan expects), then clear the window to black.
-void capture_and_blank(EGLDisplay dpy, EGLSurface surf, int slot)
+// Copy framebuffer `src` (0 = the window) into ring slot `slot`, scaled and
+// flipped so row 0 is the top, as Vulkan expects.
+void copy_to_slot(GLuint src, int w, int h, int slot)
 {
-	EGLint w = 0, h = 0;
-	eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
-	eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-	if (w <= 0 || h <= 0) return;
+	GLuint read = src;
+	if (src == 0) {
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		GLint samples = 0;
+		glGetIntegerv(GL_SAMPLE_BUFFERS, &samples);
+		if (samples > 0 && ensure_mid(w, h)) {  // resolve the multisampled window first
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_mid_fbo);
+			glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+			read = g_mid_fbo;
+		}
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_slots[slot].fbo);
+	glBlitFramebuffer(0, 0, w, h, 0, g_ring_h, g_ring_w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+}
 
+// Left eye = the window, right eye = its twin. Then clear the window to black:
+// the helper's overlay shows the 3D picture instead.
+void capture_pair_and_blank(int w, int h, int slot_l, int slot_r)
+{
 	GLint read_fbo = 0, draw_fbo = 0;
 	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
@@ -227,22 +240,9 @@ void capture_and_blank(EGLDisplay dpy, EGLSurface surf, int slot)
 	glGetBooleanv(GL_COLOR_WRITEMASK, mask);
 	glDisable(GL_SCISSOR_TEST);
 
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-	GLint samples = 0;
-	glGetIntegerv(GL_SAMPLE_BUFFERS, &samples);
+	copy_to_slot(0, w, h, slot_l);
+	copy_to_slot(stereo_window_twin_fbo(), w, h, slot_r);
 
-	GLuint src = 0;
-	if (samples > 0 && ensure_mid(w, h)) {
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_mid_fbo);
-		glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-		src = g_mid_fbo;
-	}
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_slots[slot].fbo);
-	glBlitFramebuffer(0, 0, w, h, 0, g_ring_h, g_ring_w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-
-	// Blank the window: the helper's overlay shows the 3D picture instead.
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	glClearColor(0, 0, 0, 1);
@@ -257,47 +257,42 @@ void capture_and_blank(EGLDisplay dpy, EGLSurface surf, int slot)
 
 void on_swap(EGLDisplay dpy, EGLSurface surf)
 {
+	GLBypass bypass;  // our own GL calls must not be doubled / tracked
 	g_swaps.fetch_add(1, std::memory_order_relaxed);
 	g_dpy.store(dpy);
-	const bool want = g_enabled.load() && g_presenting.load() && g_tile_w.load() > 0 && !g_ring_failed;
-	if (!want) {
-		if (g_stereo_active) {
-			g_stereo_active = false;
-			g_eye_x.store(0.0f);
-		}
-		return;
-	}
-	if (!load_ext()) {
+	EGLint w = 0, h = 0;
+	eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
+	eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+
+	bool ready = g_enabled.load() && g_presenting.load() && g_tile_w.load() > 0 && !g_ring_failed &&
+	             stereo_hooks_ok();
+	if (ready && !load_ext()) {
 		set_problem("this GPU driver lacks AHardwareBuffer sharing");
 		g_ring_failed = true;
-		return;
+		ready = false;
 	}
-	const int tw = g_tile_w.load(), th = g_tile_h.load();
-	if (tw != g_ring_w || th != g_ring_h) {
-		destroy_ring(dpy);
-		if (!create_ring(dpy, tw, th)) {
-			g_ring_failed = true;
-			return;
+	if (ready) {
+		const int tw = g_tile_w.load(), th = g_tile_h.load();
+		if (tw != g_ring_w || th != g_ring_h) {
+			destroy_ring(dpy);
+			if (!create_ring(dpy, tw, th)) {
+				g_ring_failed = true;
+				ready = false;
+			}
 		}
 	}
-	if (g_acked_gen.load() != g_ring_gen.load()) {
-		// Helper has not accepted these buffers yet: keep showing normal 2D.
-		if (g_stereo_active) {
-			g_stereo_active = false;
-			g_eye_x.store(0.0f);
-		}
-		return;
-	}
-	if (g_stereo_active) {
-		// This frame was rendered for g_frame_eye: ship it.
-		const int slot = g_seq % kSlots;
-		capture_and_blank(dpy, surf, slot);
+	ready = ready && g_acked_gen.load() == g_ring_gen.load();
+
+	if (ready && stereo_frame_was_stereo() && w > 0 && h > 0) {
+		// The frame just finished was rendered for both eyes: ship the pair.
+		const int pair = g_seq % (kSlots / 2);
+		capture_pair_and_blank(w, h, pair * 2, pair * 2 + 1);
 		EGLSyncKHR sync = p_createSync(dpy, EGL_SYNC_FENCE_KHR, nullptr);
 		glFlush();
 		{
 			std::lock_guard<std::mutex> l(g_mu);
-			g_jobs.push_back({g_ring_gen.load(), slot, g_frame_eye, g_seq, sync});
-			while (g_jobs.size() > kSlots - 2) {  // sender is behind: drop the oldest
+			g_jobs.push_back({g_ring_gen.load(), pair * 2, pair * 2 + 1, g_seq, sync});
+			while (g_jobs.size() > 1) {  // sender is behind: drop the oldest
 				if (g_jobs.front().sync != EGL_NO_SYNC_KHR) p_destroySync(dpy, g_jobs.front().sync);
 				g_jobs.pop_front();
 			}
@@ -305,13 +300,9 @@ void on_swap(EGLDisplay dpy, EGLSurface surf)
 		g_cv.notify_all();
 		g_captured.fetch_add(1, std::memory_order_relaxed);
 		++g_seq;
-		g_frame_eye ^= 1;
-	} else {
-		g_stereo_active = true;
-		g_frame_eye = 0;
 	}
-	// Eye 0 = left: the camera moves to -x.
-	g_eye_x.store(g_frame_eye == 0 ? -kHalfIpd : kHalfIpd);
+	g_stereo_active = ready;
+	stereo_frame_boundary(ready, w, h);  // next frame: both eyes, or plain 2D
 }
 
 thread_local bool t_in_swap = false;
@@ -517,7 +508,9 @@ void sender_main()
 				p_destroySync(dpy, job.sync);
 			}
 			if (job.gen == g_acked_gen.load()) {
-				env->CallStaticBooleanMethod(g_cls, m_frame, job.slot, job.eye, job.seq);
+				env->CallStaticBooleanMethod(g_cls, m_frame, job.slot_l, 0, job.seq);
+				clear_exc(env);
+				env->CallStaticBooleanMethod(g_cls, m_frame, job.slot_r, 1, job.seq);
 				clear_exc(env);
 				g_sent.fetch_add(1, std::memory_order_relaxed);
 			}
@@ -578,7 +571,7 @@ std::vector<std::string> bridge_lines()
 	} else if (g_acked_gen.load() != g_ring_gen.load() || g_ring_w == 0) {
 		out.emplace_back("Helper app: connected, sharing eye pictures...");
 	} else {
-		std::snprintf(b, sizeof b, "3D ON: sending %.0f eye pictures/s (%dx%d each)%s", sent_s, g_ring_w, g_ring_h,
+		std::snprintf(b, sizeof b, "3D ON: %.0f left+right pairs/s (%dx%d per eye)%s", sent_s, g_ring_w, g_ring_h,
 		              g_swap_rb ? "  [colours may be swapped]" : "");
 		out.emplace_back(b);
 	}
