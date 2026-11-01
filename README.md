@@ -5,15 +5,14 @@ stereo 3D on the Leia Lume Pad 2 through the [DisplayXR](https://github.com/Disp
 
 ## Test 5 (v0.5.0): both eyes every frame
 
-This follows the DisplayXR stereo method from the DXVK stereo fork ("per-eye replay"), done as
-OpenGL ES hooks inside Minecraft (`src/StereoGL.cpp`):
+This renders each eye separately (every stereo draw runs once per eye), done as OpenGL ES hooks
+inside Minecraft (`src/StereoGL.cpp`):
 
 - Every non-square render target gets a right-eye twin, and the window does too. Square targets
   (shadow maps) stay single.
 - Every draw into a stereo framebuffer runs twice: the left eye draws into the real target, and the
   right eye draws into the twin with twin textures substituted.
-- The camera matrices are patched per eye with an off-axis shift. This is "option A": the engine's
-  camera is patched for each eye.
+- The engine's camera matrices are patched per eye with an off-axis shift.
 - Clears and blits are mirrored onto the twins.
 
 At each swap, the left and right pictures of the same frame go to the helper app as a pair.

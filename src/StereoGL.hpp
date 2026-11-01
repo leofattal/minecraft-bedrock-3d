@@ -1,5 +1,5 @@
-// Per-draw stereo for Minecraft's OpenGL ES renderer — the DisplayXR stereo
-// method (DXVK stereo fork, "per-eye replay"), done with GL hooks in-process:
+// Per-draw stereo for Minecraft's OpenGL ES renderer, done with GL hooks
+// in-process:
 //
 //  * Every non-square render target (texture or renderbuffer attached to a
 //    framebuffer) gets a right-eye twin; every framebuffer that draws into one
@@ -9,7 +9,7 @@
 //    one, right eye into the twin, with twins substituted for any stereo
 //    texture the draw samples. Screen-space passes (lighting, post, HUD) thus
 //    run once per eye.
-//  * The eye is applied by patching the camera matrices per eye ("option A":
+//  * The eye is applied by patching the camera matrices per eye (the
 //    projection gets an off-axis shift; perspective matrices only, so 2D/HUD
 //    passes are unshifted and sit at screen depth).
 //  * Clears and blits are mirrored onto the twins.

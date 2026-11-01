@@ -3,7 +3,7 @@
 //
 // Uniform names (u_proj / PROJ) follow BedrockTools' motion blur module
 // (https://github.com/QYCottage/BedrockTools, MIT, (c) 2026 RadiantByte).
-// The per-draw stereo method follows the DisplayXR stereo work (DXVK stereo fork).
+// Per-draw stereo: each draw into a stereo target runs once per eye.
 #include "Probe.hpp"
 #include "Bridge.hpp"
 #include "StereoGL.hpp"

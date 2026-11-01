@@ -415,7 +415,7 @@ void forget_rb(GLuint rb)
 
 inline bool active() { return t_stereo && t_bypass == 0; }
 
-// ---- the per-eye replay ---------------------------------------------------------
+// ---- each stereo draw, once per eye ---------------------------------------------
 template <class F>
 void stereo_draw(F &&draw)
 {
