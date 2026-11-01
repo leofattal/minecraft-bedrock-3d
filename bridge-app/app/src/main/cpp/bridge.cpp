@@ -23,6 +23,7 @@
 #include <android/hardware_buffer.h>
 #include <android/hardware_buffer_jni.h>
 #include <android/log.h>
+#include <android/looper.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <jni.h>
@@ -198,6 +199,28 @@ bool xr_proc(const char *name, T *out) {
          *out != nullptr;
 }
 
+// ─────────────────────────────── looper ──────────────────────────────────────
+// The vendor display processor (Leia SR) is created on the thread that calls
+// xrCreateSession and posts its async init to that thread's ALooper; with no
+// looper it tears down at once and nothing is ever woven (runtime
+// oxr_session_gfx_vk_native.c). So this thread gets a looper, pumped like
+// native_app_glue's android_main thread.
+void pump_looper(int timeout_ms) {
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  for (int i = 0; i < 64; ++i) {
+    const int left = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                         end - std::chrono::steady_clock::now()).count();
+    const int r = ALooper_pollOnce(left > 0 ? left : 0, nullptr, nullptr, nullptr);
+    if (r == ALOOPER_POLL_TIMEOUT || r == ALOOPER_POLL_ERROR) break;
+    if (g_stop) break;
+  }
+}
+
+void sleep_pumping(int ms) {
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+  while (!g_stop && std::chrono::steady_clock::now() < end) pump_looper(20);
+}
+
 // ───────────────────────────── bring-up ──────────────────────────────────────
 
 bool init_loader() {
@@ -267,7 +290,7 @@ bool create_instance() {
   for (int i = 0; i < 5 && !g_stop; ++i) {
     r = xrCreateInstance(&ci, &g_instance);
     if (r != XR_ERROR_RUNTIME_UNAVAILABLE) break;
-    usleep(400 * 1000);
+    sleep_pumping(400);
   }
   if (!xr_ok(r, "xrCreateInstance")) return false;
 
@@ -1190,6 +1213,7 @@ void destroy_all() {
 void xr_thread_main() {
   JNIEnv *env = nullptr;
   g_vm->AttachCurrentThread(&env, nullptr);
+  ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
   int fails = 0;
   while (!g_stop) {
     apply_pending_surface();
@@ -1197,20 +1221,20 @@ void xr_thread_main() {
       if (!init_loader() || !create_instance() || !create_vulkan()) {
         destroy_all();
         ++fails;
-        for (int i = 0; i < 30 && !g_stop; ++i) usleep(100000);  // retry in 3 s
+        sleep_pumping(3000);  // retry in 3 s
         continue;
       }
     }
     if (g_session == XR_NULL_HANDLE) {
       if (!g_window) {
         set_stage("waiting for the overlay surface");
-        usleep(50000);
+        sleep_pumping(50);
         continue;
       }
       push_geometry();
       if (!create_session()) {
         destroy_session();
-        for (int i = 0; i < 30 && !g_stop; ++i) usleep(100000);
+        sleep_pumping(3000);
         continue;
       }
       {
@@ -1218,12 +1242,13 @@ void xr_thread_main() {
         g_error.clear();
       }
     }
+    pump_looper(0);
     apply_pending_buffers();
     push_geometry();
     poll_events();
     g_presenting = (g_session_running && g_window) ? 1 : 0;
     if (!g_session_running) {
-      usleep(20000);
+      sleep_pumping(20);
       continue;
     }
     render_frame();
