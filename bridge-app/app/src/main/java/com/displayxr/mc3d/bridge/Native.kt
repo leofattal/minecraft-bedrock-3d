@@ -14,6 +14,9 @@ object Native {
     external fun start(context: Context)
     external fun stop()
 
+    /** Main thread, every 50 ms: runs xrCreateSession here when the XR thread asks. */
+    external fun uiTick()
+
     external fun setSurface(surface: Surface?)
     external fun setWindowRect(x: Int, y: Int, w: Int, h: Int, panelW: Int, panelH: Int, displayId: Int)
 

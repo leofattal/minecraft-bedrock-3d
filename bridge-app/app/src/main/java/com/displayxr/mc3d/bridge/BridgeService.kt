@@ -79,6 +79,14 @@ class BridgeService : Service() {
     private var statusView: TextView? = null
 
     // Small status box on top of everything (also over Minecraft).
+    private val uiTick = object : Runnable {
+        override fun run() {
+            if (!running) return
+            Native.uiTick()
+            handler.postDelayed(this, 50)
+        }
+    }
+
     private val statusTick = object : Runnable {
         override fun run() {
             val v = statusView
@@ -183,6 +191,7 @@ class BridgeService : Service() {
         Native.setTestPattern(testPattern)
         handler.post(hello)
         handler.post(statusTick)
+        handler.post(uiTick)
         Choreographer.getInstance().postFrameCallback(frameCallback)
     }
 

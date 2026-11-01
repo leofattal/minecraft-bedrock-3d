@@ -221,6 +221,28 @@ void sleep_pumping(int ms) {
   while (!g_stop && std::chrono::steady_clock::now() < end) pump_looper(20);
 }
 
+// ─────────────────────── session start on the main thread ────────────────────
+// The vendor display processor is created inside xrCreateSession and posts its
+// init to the calling thread's *Java* Looper. A native ALooper on our own
+// thread is not enough (test 5d: the lens switched but every woven frame was
+// black), so xrCreateSession runs on the service's main thread, whose Looper
+// the system pumps. BridgeService calls Native.uiTick() there every 50 ms.
+bool create_session();
+bool g_ui_req = false, g_ui_done = false, g_ui_result = false;  // guarded by g_mu
+
+bool create_session_on_ui() {
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_ui_req = true;
+    g_ui_done = false;
+  }
+  std::unique_lock<std::mutex> l(g_mu);
+  g_cv.wait_for(l, std::chrono::seconds(15), [] { return g_ui_done || g_stop.load(); });
+  const bool ok = g_ui_done && g_ui_result;
+  g_ui_req = false;
+  return ok;
+}
+
 // ───────────────────────────── bring-up ──────────────────────────────────────
 
 bool init_loader() {
@@ -1232,7 +1254,7 @@ void xr_thread_main() {
         continue;
       }
       push_geometry();
-      if (!create_session()) {
+      if (!create_session_on_ui()) {
         destroy_session();
         sleep_pumping(3000);
         continue;
@@ -1281,6 +1303,20 @@ JNIEXPORT void JNICALL Java_com_displayxr_mc3d_bridge_Native_start(JNIEnv *env, 
   }
   g_stop = false;
   g_thread = std::thread(xr_thread_main);
+}
+
+JNIEXPORT void JNICALL Java_com_displayxr_mc3d_bridge_Native_uiTick(JNIEnv *, jobject) {
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    if (!g_ui_req || g_ui_done) return;
+  }
+  const bool ok = create_session();  // the XR thread is parked until we finish
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_ui_result = ok;
+    g_ui_done = true;
+  }
+  g_cv.notify_all();
 }
 
 JNIEXPORT void JNICALL Java_com_displayxr_mc3d_bridge_Native_stop(JNIEnv *, jobject) {
