@@ -1,8 +1,20 @@
-// DisplayXR 3D for Minecraft Bedrock — test 1 ("probe"). See Probe.hpp.
+// DisplayXR 3D for Minecraft Bedrock — test 2: stereo eye offset through the
+// projection matrix.
 //
-// The signature patterns and the LevelRenderer / CameraComponent offsets below
-// come from BedrockTools (https://github.com/QYCottage/BedrockTools,
-// MIT License, Copyright (c) 2026 RadiantByte) for Minecraft 1.26.60.
+// Test 1 showed that moving LevelRendererPlayer::mCamPos does not move the
+// picture. This build intercepts the matrices Minecraft (RenderDragon, a bgfx
+// derivative) uploads to its OpenGL ES shaders and applies a per-eye off-axis
+// shift there:
+//
+//   eye translation  : the camera moves `eye_x` blocks along its own x axis
+//   convergence shift: the picture shifts so blocks `kConvergence` away stay put
+//
+// For a projection matrix P that is exactly P' = S * P * T(-eye_x). For a
+// combined (view-)projection matrix the same thing is applied in clip space.
+// The world wobbles left/right twice a second to show it works.
+//
+// Uniform names (u_proj / PROJ) follow BedrockTools' motion blur module
+// (https://github.com/QYCottage/BedrockTools, MIT, (c) 2026 RadiantByte).
 #include "Probe.hpp"
 
 #include <EGL/egl.h>
@@ -13,18 +25,19 @@
 
 #include <pl/ModMenu.hpp>
 #include <pl/memory/Hook.hpp>
-#include <pl/memory/Signature.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "displayxr3d", __VA_ARGS__)
@@ -32,256 +45,276 @@
 namespace dxr3d {
 namespace {
 
-// ---- Minecraft 1.26.60 (arm64) — from BedrockTools ------------------------
 constexpr const char *kMinecraftLib = "libminecraftpe.so";
-constexpr const char *kSigRenderLevel =
-    "? ? ? D1 ? ? ? FD ? ? ? 6D ? ? ? 6D ? ? ? 6D ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 57 D0 3B D5";
-constexpr const char *kSigUpdatePlayerFromCamera =
-    "? ? ? D1 ? ? ? FD ? ? ? A9 ? ? ? F9 ? ? ? A9 ? ? ? A9 ? ? ? 91 54 D0 3B D5 ? ? ? 52";
-constexpr std::size_t kLevelRenderer_mLevelRendererPlayer = 0x430;
-constexpr std::size_t kLevelRendererPlayer_mCamPos = 0x614;
-constexpr std::size_t kCameraComponent_mOrientation = 0x28;
-
-// ---- Probe settings --------------------------------------------------------
-constexpr float kWobbleBlocks = 0.30f;   // sideways camera shift per eye
-constexpr int kWobbleHalfPeriodMs = 500; // left 0.5 s, right 0.5 s
 constexpr const char *kModuleId = "displayxr3d.probe";
+constexpr const char *kVersion = "v0.2.0";
+
+constexpr float kWobbleBlocks = 0.30f;   // eye offset for the wobble demo
+constexpr float kConvergence = 4.0f;     // blocks; this distance stays still
+constexpr int kWobbleHalfPeriodMs = 500;
 
 using Clock = std::chrono::steady_clock;
 
-JavaVM *g_vm = nullptr;
-std::filesystem::path g_data_dir;
 std::atomic<bool> g_started{false};
 std::atomic<bool> g_wobble{true};
 std::atomic<bool> g_panel{true};
 
-// Hook state
-void (*g_render_level_orig)(void *, void *, void *) = nullptr;
-void (*g_camera_orig)(void *, void *, void *) = nullptr;
-void (*g_gl_clear_orig)(GLbitfield) = nullptr;
-bool g_sig_render = false, g_sig_camera = false;
-bool g_hook_render = false, g_hook_camera = false, g_hook_clear = false;
+// ---- GL hooks ---------------------------------------------------------------
+void (*o_glUseProgram)(GLuint) = nullptr;
+void (*o_glLinkProgram)(GLuint) = nullptr;
+void (*o_glUniformMatrix4fv)(GLint, GLsizei, GLboolean, const GLfloat *) = nullptr;
+void (*o_glUniform4fv)(GLint, GLsizei, const GLfloat *) = nullptr;
+void (*o_glClear)(GLbitfield) = nullptr;
+bool g_hooked[5] = {};
 
-std::atomic<uint64_t> g_render_calls{0};
-std::atomic<uint64_t> g_camera_calls{0};
-std::atomic<uint64_t> g_clear_calls{0};
-std::atomic<uint64_t> g_shifted_frames{0};
+enum Kind : uint8_t { kProj, kCombined };
 
-std::mutex g_cam_mu;
-float g_quat[4] = {0, 0, 0, 1};  // x y z w
-bool g_quat_valid = false;
-float g_cam_pos[3] = {0, 0, 0};
+struct Target
+{
+	GLint location;
+	Kind kind;
+	bool vec4_array;  // uploaded as vec4[4] (columns) instead of mat4
+};
 
-// GL info (captured once on the GL thread)
-std::mutex g_gl_mu;
-bool g_gl_seen = false;
+struct ProgramInfo
+{
+	std::vector<Target> targets;
+};
+
+// Render thread only.
+GLuint g_current_program = 0;
+std::unordered_map<GLuint, ProgramInfo> g_programs;
+float g_last_p00 = 0.0f;  // x scale of the last perspective projection
+
+// Stats (atomics: read by the panel thread).
+std::atomic<uint64_t> g_frames{0};
+std::atomic<uint64_t> g_mod_proj{0};
+std::atomic<uint64_t> g_mod_combined{0};
+std::atomic<uint64_t> g_programs_with_targets{0};
+std::atomic<uint64_t> g_programs_seen{0};
+
+std::mutex g_info_mu;
+std::set<std::string> g_matrix_names;  // every mat4 / vec4[4] uniform name seen
 std::string g_gl_version = "not seen yet";
 std::string g_gl_renderer;
-bool g_gl_oes_egl_image = false;
-bool g_egl_native_buffer = false;
-bool g_egl_client_buffer = false;
 
-AndroidReport g_android;
-std::mutex g_android_mu;
+std::atomic<float> g_eye_x{0.0f};  // current eye offset in blocks (render thread reads)
 
-// Current eye offset sign: -1 left, +1 right.
-float wobble_sign()
+bool is_proj_name(const std::string &n)
 {
-	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-	                    Clock::now().time_since_epoch()).count();
-	return ((ms / kWobbleHalfPeriodMs) & 1) ? 1.0f : -1.0f;
+	return n == "u_proj" || n == "PROJ" || n == "u_projection" || n == "PROJECTION";
 }
 
-// Horizontal "right" vector of the camera, from its orientation quaternion.
-void camera_right(float out[3])
+bool is_combined_name(const std::string &n)
 {
-	float x, y, z, w;
-	bool valid;
-	{
-		std::lock_guard<std::mutex> lock(g_cam_mu);
-		x = g_quat[0]; y = g_quat[1]; z = g_quat[2]; w = g_quat[3];
-		valid = g_quat_valid;
+	return n == "u_viewProj" || n == "u_modelViewProj" || n == "VIEWPROJ" || n == "WORLDVIEWPROJ" ||
+	       n == "VIEW_PROJ" || n == "WORLD_VIEW_PROJ" || n == "u_viewProjection";
+}
+
+const ProgramInfo &program_info(GLuint program)
+{
+	auto it = g_programs.find(program);
+	if (it != g_programs.end()) return it->second;
+
+	ProgramInfo info;
+	GLint count = 0;
+	glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
+	std::vector<Target> proj, combined;
+	std::vector<std::string> names;
+	for (GLint i = 0; i < count && i < 256; ++i) {
+		char buf[128] = {};
+		GLsizei len = 0;
+		GLint size = 0;
+		GLenum type = 0;
+		glGetActiveUniform(program, i, sizeof(buf), &len, &size, &type, buf);
+		std::string name(buf, std::max(0, (int)len));
+		if (name.size() > 3 && name.compare(name.size() - 3, 3, "[0]") == 0) name.resize(name.size() - 3);
+		const bool mat = type == GL_FLOAT_MAT4 && size == 1;
+		const bool vec4x4 = type == GL_FLOAT_VEC4 && size == 4;
+		if (!mat && !vec4x4) continue;
+		names.push_back(name);
+		const GLint loc = glGetUniformLocation(program, buf);
+		if (loc < 0) continue;
+		if (is_proj_name(name)) proj.push_back({loc, kProj, vec4x4});
+		else if (is_combined_name(name)) combined.push_back({loc, kCombined, vec4x4});
 	}
-	float rx = 1, rz = 0;
-	if (valid) {
-		// q * (1,0,0) * q^-1
-		rx = 1 - 2 * (y * y + z * z);
-		rz = 2 * (x * z - w * y);
+	while (glGetError() != GL_NO_ERROR) {
 	}
-	const float len = std::sqrt(rx * rx + rz * rz);
-	if (!(len > 1e-4f)) {
-		rx = 1;
-		rz = 0;
+	// If the shader has a separate projection, only that one is changed;
+	// otherwise the combined matrices are.
+	info.targets = !proj.empty() ? proj : combined;
+	g_programs_seen.fetch_add(1, std::memory_order_relaxed);
+	if (!info.targets.empty()) g_programs_with_targets.fetch_add(1, std::memory_order_relaxed);
+	if (!names.empty()) {
+		std::lock_guard<std::mutex> lock(g_info_mu);
+		for (auto &n : names)
+			if (g_matrix_names.size() < 40) g_matrix_names.insert(n);
+	}
+	if (g_programs.size() > 4096) g_programs.clear();
+	return g_programs.emplace(program, std::move(info)).first->second;
+}
+
+const Target *find_target(GLint location)
+{
+	if (!g_current_program || location < 0) return nullptr;
+	const ProgramInfo &info = program_info(g_current_program);
+	for (const auto &t : info.targets)
+		if (t.location == location) return &t;
+	return nullptr;
+}
+
+// Column-major 4x4: element (row r, col c) = m[c * 4 + r].
+bool is_perspective(const float *m)
+{
+	// Row 3 (w output) must depend on z, and not be (0,0,0,1).
+	return std::fabs(m[11]) > 0.5f && std::fabs(m[15]) < 0.01f && std::fabs(m[0]) > 0.01f &&
+	       std::isfinite(m[0]) && std::isfinite(m[12]);
+}
+
+bool apply_eye(float *m, Kind kind, float eye_x)
+{
+	if (!is_perspective(m)) return false;
+	float p00;
+	if (kind == kProj) {
+		p00 = m[0];
+		g_last_p00 = p00;
+		// P * T(-eye_x): column 3 += -eye_x * column 0
+		for (int r = 0; r < 4; ++r) m[12 + r] += -eye_x * m[r];
 	} else {
-		rx /= len;
-		rz /= len;
+		// Combined matrix: in clip space x += -eye_x * P00 (view-space w = 1).
+		p00 = g_last_p00 > 0.01f ? g_last_p00 : 0.9f;
+		m[12] += -eye_x * p00;
 	}
-	out[0] = rx;
-	out[1] = 0;
-	out[2] = rz;
+	// Convergence: clip.x += shift * clip.w (row 0 += shift * row 3).
+	const float shift = eye_x * p00 / kConvergence;
+	for (int c = 0; c < 4; ++c) m[c * 4 + 0] += shift * m[c * 4 + 3];
+	return true;
 }
 
-// ---- Hooks -----------------------------------------------------------------
-
-void render_level_detour(void *renderer, void *ctx, void *view)
+void count_mod(Kind kind)
 {
-	g_render_calls.fetch_add(1, std::memory_order_relaxed);
-	float *pos = nullptr;
-	float saved[3];
-	if (renderer) {
-		auto *player = *reinterpret_cast<std::byte **>(static_cast<std::byte *>(renderer) +
-		                                                kLevelRenderer_mLevelRendererPlayer);
-		if (player) {
-			pos = reinterpret_cast<float *>(player + kLevelRendererPlayer_mCamPos);
-			std::memcpy(saved, pos, sizeof(saved));
-			if (!std::isfinite(saved[0]) || !std::isfinite(saved[1]) || !std::isfinite(saved[2])) {
-				pos = nullptr;
-			} else {
-				std::lock_guard<std::mutex> lock(g_cam_mu);
-				std::memcpy(g_cam_pos, saved, sizeof(saved));
+	(kind == kProj ? g_mod_proj : g_mod_combined).fetch_add(1, std::memory_order_relaxed);
+}
+
+void h_glUseProgram(GLuint program)
+{
+	g_current_program = program;
+	o_glUseProgram(program);
+}
+
+void h_glLinkProgram(GLuint program)
+{
+	o_glLinkProgram(program);
+	g_programs.erase(program);
+}
+
+void h_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
+{
+	const float eye = g_eye_x.load(std::memory_order_relaxed);
+	if (eye != 0.0f && count == 1 && !transpose && value) {
+		if (const Target *t = find_target(location); t && !t->vec4_array) {
+			float m[16];
+			std::memcpy(m, value, sizeof(m));
+			if (apply_eye(m, t->kind, eye)) {
+				count_mod(t->kind);
+				o_glUniformMatrix4fv(location, count, transpose, m);
+				return;
 			}
 		}
 	}
-	const bool shift = pos != nullptr && g_wobble.load(std::memory_order_relaxed);
-	if (shift) {
-		float r[3];
-		camera_right(r);
-		const float s = wobble_sign() * kWobbleBlocks;
-		for (int i = 0; i < 3; ++i) pos[i] = saved[i] + r[i] * s;
-		g_shifted_frames.fetch_add(1, std::memory_order_relaxed);
+	o_glUniformMatrix4fv(location, count, transpose, value);
+}
+
+void h_glUniform4fv(GLint location, GLsizei count, const GLfloat *value)
+{
+	const float eye = g_eye_x.load(std::memory_order_relaxed);
+	if (eye != 0.0f && count == 4 && value) {
+		if (const Target *t = find_target(location); t && t->vec4_array) {
+			float m[16];
+			std::memcpy(m, value, sizeof(m));
+			if (apply_eye(m, t->kind, eye)) {
+				count_mod(t->kind);
+				o_glUniform4fv(location, count, m);
+				return;
+			}
+		}
 	}
-	g_render_level_orig(renderer, ctx, view);
-	if (shift) std::memcpy(pos, saved, sizeof(saved));
+	o_glUniform4fv(location, count, value);
 }
 
-void camera_detour(void *camera, void *component, void *player)
+void h_glClear(GLbitfield mask)
 {
-	g_camera_orig(camera, component, player);
-	g_camera_calls.fetch_add(1, std::memory_order_relaxed);
-	if (!camera) return;
-	float q[4];
-	std::memcpy(q, static_cast<std::byte *>(camera) + kCameraComponent_mOrientation, sizeof(q));
-	const float len = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
-	if (!std::isfinite(len) || len < 0.5f || len > 1.5f) return;
-	std::lock_guard<std::mutex> lock(g_cam_mu);
-	std::memcpy(g_quat, q, sizeof(q));
-	g_quat_valid = true;
-}
-
-void gl_clear_detour(GLbitfield mask)
-{
-	g_clear_calls.fetch_add(1, std::memory_order_relaxed);
-	static std::atomic<bool> captured{false};
-	if (!captured.load(std::memory_order_relaxed) && eglGetCurrentContext() != EGL_NO_CONTEXT) {
+	g_frames.fetch_add(1, std::memory_order_relaxed);
+	static bool captured = false;
+	if (!captured && eglGetCurrentContext() != EGL_NO_CONTEXT) {
 		const char *ver = reinterpret_cast<const char *>(glGetString(GL_VERSION));
 		const char *ren = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
 		if (ver) {
-			bool oes = false;
-			GLint n = 0;
-			glGetIntegerv(GL_NUM_EXTENSIONS, &n);
-			for (GLint i = 0; i < n; ++i) {
-				const char *e = reinterpret_cast<const char *>(glGetStringi(GL_EXTENSIONS, i));
-				if (e && std::strcmp(e, "GL_OES_EGL_image") == 0) oes = true;
-			}
-			while (glGetError() != GL_NO_ERROR) {
-			}
-			const char *egl_ext = eglQueryString(eglGetCurrentDisplay(), EGL_EXTENSIONS);
-			std::lock_guard<std::mutex> lock(g_gl_mu);
-			g_gl_seen = true;
+			std::lock_guard<std::mutex> lock(g_info_mu);
 			g_gl_version = ver;
 			g_gl_renderer = ren ? ren : "";
-			g_gl_oes_egl_image = oes;
-			g_egl_native_buffer = egl_ext && std::strstr(egl_ext, "EGL_ANDROID_image_native_buffer");
-			g_egl_client_buffer = egl_ext && std::strstr(egl_ext, "EGL_ANDROID_get_native_client_buffer");
-			captured.store(true);
+			captured = true;
 		}
 	}
-	g_gl_clear_orig(mask);
+	o_glClear(mask);
 }
 
-bool install_hook(uintptr_t target, void *detour, void **orig)
+void install_gl_hooks()
 {
-	if (!target) return false;
-	return pl::memory::hook(reinterpret_cast<void *>(target), detour, orig) == 0;
-}
-
-void install_hooks()
-{
-	const uintptr_t render = pl::memory::resolveSignature(kSigRenderLevel, kMinecraftLib);
-	const uintptr_t camera = pl::memory::resolveSignature(kSigUpdatePlayerFromCamera, kMinecraftLib);
-	g_sig_render = render != 0;
-	g_sig_camera = camera != 0;
-	g_hook_render = install_hook(render, (void *)render_level_detour, (void **)&g_render_level_orig);
-	g_hook_camera = install_hook(camera, (void *)camera_detour, (void **)&g_camera_orig);
-
-	if (void *gles = dlopen("libGLESv2.so", RTLD_NOW)) {
-		const auto clear = reinterpret_cast<uintptr_t>(dlsym(gles, "glClear"));
-		g_hook_clear = install_hook(clear, (void *)gl_clear_detour, (void **)&g_gl_clear_orig);
+	void *gles = dlopen("libGLESv2.so", RTLD_NOW);
+	if (!gles) return;
+	struct H { const char *name; void *detour; void **orig; };
+	const H hooks[] = {
+	    {"glUseProgram", (void *)h_glUseProgram, (void **)&o_glUseProgram},
+	    {"glLinkProgram", (void *)h_glLinkProgram, (void **)&o_glLinkProgram},
+	    {"glUniformMatrix4fv", (void *)h_glUniformMatrix4fv, (void **)&o_glUniformMatrix4fv},
+	    {"glUniform4fv", (void *)h_glUniform4fv, (void **)&o_glUniform4fv},
+	    {"glClear", (void *)h_glClear, (void **)&o_glClear},
+	};
+	for (int i = 0; i < 5; ++i) {
+		void *sym = dlsym(gles, hooks[i].name);
+		g_hooked[i] = sym && pl::memory::hook(sym, hooks[i].detour, hooks[i].orig) == 0;
 	}
-	LOGI("signatures render=%d camera=%d hooks render=%d camera=%d glClear=%d", g_sig_render,
-	     g_sig_camera, g_hook_render, g_hook_camera, g_hook_clear);
+	LOGI("GL hooks: use=%d link=%d mat4=%d vec4=%d clear=%d", g_hooked[0], g_hooked[1], g_hooked[2],
+	     g_hooked[3], g_hooked[4]);
 }
 
-// ---- On-screen panel --------------------------------------------------------
+// ---- Panel -------------------------------------------------------------------
 
-const char *yn(bool b) { return b ? "YES" : "no"; }
-
-std::vector<std::string> report_lines(double render_per_s, double camera_per_s)
+std::vector<std::string> report_lines(double fps, double proj_s, double comb_s)
 {
 	std::vector<std::string> lines;
-	char buf[256];
-	lines.emplace_back("DisplayXR 3D - TEST 1 (probe)  v0.1.0");
-
-	std::snprintf(buf, sizeof(buf), "A) Hooks: world-render %s/%s   camera %s/%s   glClear %s",
-	              g_sig_render ? "found" : "MISSING", g_hook_render ? "hooked" : "FAILED",
-	              g_sig_camera ? "found" : "MISSING", g_hook_camera ? "hooked" : "FAILED",
-	              g_hook_clear ? "hooked" : "FAILED");
+	char buf[300];
+	std::snprintf(buf, sizeof(buf), "DisplayXR 3D - TEST 2 (eye offset)  %s", kVersion);
 	lines.emplace_back(buf);
-
-	float pos[3];
-	bool qv;
+	std::snprintf(buf, sizeof(buf), "A) GL hooks: program %s  link %s  matrix %s  vec4 %s  clear %s",
+	              g_hooked[0] ? "ok" : "FAIL", g_hooked[1] ? "ok" : "FAIL", g_hooked[2] ? "ok" : "FAIL",
+	              g_hooked[3] ? "ok" : "FAIL", g_hooked[4] ? "ok" : "FAIL");
+	lines.emplace_back(buf);
+	std::snprintf(buf, sizeof(buf), "B) Frames/s %.0f   projection changes/s %.0f   combined changes/s %.0f",
+	              fps, proj_s, comb_s);
+	lines.emplace_back(buf);
+	std::snprintf(buf, sizeof(buf), "   Shaders seen %llu, with a 3D camera matrix %llu",
+	              (unsigned long long)g_programs_seen.load(),
+	              (unsigned long long)g_programs_with_targets.load());
+	lines.emplace_back(buf);
 	{
-		std::lock_guard<std::mutex> lock(g_cam_mu);
-		std::memcpy(pos, g_cam_pos, sizeof(pos));
-		qv = g_quat_valid;
-	}
-	std::snprintf(buf, sizeof(buf), "B) World renders/s: %.0f   camera updates/s: %.0f   cam %.1f %.1f %.1f  %s",
-	              render_per_s, camera_per_s, pos[0], pos[1], pos[2], qv ? "(facing ok)" : "(no facing)");
-	lines.emplace_back(buf);
-	std::snprintf(buf, sizeof(buf), "   Wobble %s: the world should shift left/right twice a second",
-	              g_wobble.load() ? "ON" : "OFF");
-	lines.emplace_back(buf);
-
-	{
-		std::lock_guard<std::mutex> lock(g_gl_mu);
-		std::snprintf(buf, sizeof(buf), "C) GPU: %s | %s", g_gl_version.c_str(), g_gl_renderer.c_str());
+		std::lock_guard<std::mutex> lock(g_info_mu);
+		std::string names = "C) Matrices: ";
+		for (const auto &n : g_matrix_names) {
+			if (names.size() > 150) {
+				names += "...";
+				break;
+			}
+			names += n + " ";
+		}
+		lines.push_back(names);
+		std::snprintf(buf, sizeof(buf), "   GPU: %.60s", g_gl_version.c_str());
 		lines.emplace_back(buf);
-		if (g_gl_seen) {
-			std::snprintf(buf, sizeof(buf), "   Image sharing: GL_OES_EGL_image %s  native_buffer %s  client_buffer %s",
-			              yn(g_gl_oes_egl_image), yn(g_egl_native_buffer), yn(g_egl_client_buffer));
-			lines.emplace_back(buf);
-		}
 	}
-
-	{
-		std::lock_guard<std::mutex> lock(g_android_mu);
-		const AndroidReport &a = g_android;
-		if (!a.done) {
-			lines.emplace_back("D) DisplayXR check: running...");
-		} else {
-			std::snprintf(buf, sizeof(buf), "D) App %s (Android API %d)  %s", a.package_name, a.sdk, a.error);
-			lines.emplace_back(buf);
-			std::snprintf(buf, sizeof(buf), "   DisplayXR runtime visible: %s (in-proc %s)  broker %s  runtime services %d",
-			              yn(a.runtime_out_of_process), yn(a.runtime_in_process), yn(a.broker_provider),
-			              a.runtime_services);
-			lines.emplace_back(buf);
-			std::snprintf(buf, sizeof(buf), "   Leia display %s  head tracking %s  camera perm %s  see-all-apps perm %s",
-			              yn(a.leia_display_config), yn(a.leia_head_tracking), yn(a.perm_camera),
-			              yn(a.perm_query_all));
-			lines.emplace_back(buf);
-		}
-	}
-	lines.emplace_back("Please send a screenshot of this panel.");
+	lines.emplace_back(g_wobble.load() ? "Wobble ON: the world should jump left/right twice a second"
+	                                   : "Wobble OFF");
+	lines.emplace_back("Please send a screenshot, and say if the world wobbles.");
 	return lines;
 }
 
@@ -291,28 +324,30 @@ void register_module()
 {
 	pl::modmenu::ModuleInfo info;
 	info.moduleId = kModuleId;
-	info.displayName = "DisplayXR 3D probe";
-	info.description = "Test 1: camera wobble + compatibility report";
+	info.displayName = "DisplayXR 3D test";
+	info.description = "Test 2: stereo eye offset (world wobbles left/right)";
 	info.modId = "displayxr3d";
 	info.defaultEnabled = true;
 	info.onToggle = [](std::string_view, bool enabled) {
 		g_wobble.store(enabled);
 		g_panel.store(enabled);
-		if (!enabled) pl::modmenu::submitDrawCommands(kModuleId, {});
+		if (!enabled) {
+			g_eye_x.store(0.0f);
+			pl::modmenu::submitDrawCommands(kModuleId, {});
+		}
 	};
 	g_module_registered = pl::modmenu::registerModule(info);
-	LOGI("modmenu module registered=%d", g_module_registered);
 }
 
 void submit_panel(const std::vector<std::string> &lines)
 {
-	constexpr float x = 24, y0 = 70, size = 22, step = 28;
+	constexpr float x = 140, y0 = 70, size = 22, step = 28;
 	std::vector<pl::modmenu::DrawCommand> cmds;
 	pl::modmenu::DrawCommand bg;
 	bg.type = pl::modmenu::DrawCommandType::RectFilled;
 	bg.x = x - 10;
 	bg.y = y0 - 8;
-	bg.w = 1150;
+	bg.w = 1000;
 	bg.h = step * lines.size() + 12;
 	bg.color = 0xB0000000;
 	cmds.push_back(bg);
@@ -321,7 +356,7 @@ void submit_panel(const std::vector<std::string> &lines)
 		t.type = pl::modmenu::DrawCommandType::Text;
 		t.x = x;
 		t.y = y0 + step * i;
-		t.w = 1130;
+		t.w = 980;
 		t.h = step;
 		t.size = size;
 		t.color = i == 0 ? 0xFF55FFFF : 0xFFFFFFFF;
@@ -331,17 +366,8 @@ void submit_panel(const std::vector<std::string> &lines)
 	pl::modmenu::submitDrawCommands(kModuleId, cmds);
 }
 
-void write_report_file(const std::vector<std::string> &lines)
-{
-	std::error_code ec;
-	std::filesystem::create_directories(g_data_dir, ec);
-	std::ofstream f(g_data_dir / "probe_report.txt", std::ios::trunc);
-	for (const auto &l : lines) f << l << '\n';
-}
-
 void worker()
 {
-	// 1. Wait for Minecraft's native library.
 	for (;;) {
 		if (void *h = dlopen(kMinecraftLib, RTLD_NOW | RTLD_NOLOAD)) {
 			dlclose(h);
@@ -349,48 +375,41 @@ void worker()
 		}
 		usleep(200 * 1000);
 	}
-	install_hooks();
-
-	// 2. Give the activity time to start, then run the Android checks.
+	install_gl_hooks();
 	std::this_thread::sleep_for(std::chrono::seconds(4));
 	register_module();
-	{
-		AndroidReport r;
-		run_android_probe(g_vm, r);
-		std::lock_guard<std::mutex> lock(g_android_mu);
-		g_android = r;
-	}
 
-	// 3. Refresh the panel twice a second.
-	uint64_t last_render = g_render_calls.load(), last_camera = g_camera_calls.load();
+	uint64_t last_f = g_frames.load(), last_p = g_mod_proj.load(), last_c = g_mod_combined.load();
 	auto last_t = Clock::now();
 	int tick = 0;
 	for (;;) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		// Update the eye offset often so the switch is crisp.
+		for (int i = 0; i < 10; ++i) {
+			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                    Clock::now().time_since_epoch()).count();
+			const float side = ((ms / kWobbleHalfPeriodMs) & 1) ? 1.0f : -1.0f;
+			g_eye_x.store(g_wobble.load() ? side * kWobbleBlocks : 0.0f);
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
 		const auto now = Clock::now();
 		const double dt = std::chrono::duration<double>(now - last_t).count();
-		const uint64_t rc = g_render_calls.load(), cc = g_camera_calls.load();
-		const auto lines = report_lines((rc - last_render) / dt, (cc - last_camera) / dt);
-		last_render = rc;
-		last_camera = cc;
+		const uint64_t f = g_frames.load(), p = g_mod_proj.load(), c = g_mod_combined.load();
+		const auto lines = report_lines((f - last_f) / dt, (p - last_p) / dt, (c - last_c) / dt);
+		last_f = f;
+		last_p = p;
+		last_c = c;
 		last_t = now;
 		if (!g_module_registered && (tick % 10) == 0) register_module();
 		if (g_panel.load()) submit_panel(lines);
-		if ((tick % 10) == 0) {
-			write_report_file(lines);
+		if ((tick % 10) == 0)
 			for (const auto &l : lines) LOGI("%s", l.c_str());
-		}
 		++tick;
 	}
 }
 
 } // namespace
 
-void probe_load(JavaVM *vm, const std::filesystem::path &data_dir)
-{
-	g_vm = vm;
-	g_data_dir = data_dir;
-}
+void probe_load(JavaVM *, const std::filesystem::path &) {}
 
 void probe_enable()
 {
@@ -403,6 +422,7 @@ void probe_disable()
 {
 	g_wobble.store(false);
 	g_panel.store(false);
+	g_eye_x.store(0.0f);
 }
 
 } // namespace dxr3d

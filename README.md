@@ -3,22 +3,20 @@
 A LeviLauncher native mod for Minecraft Bedrock **1.26.60** on Android. The goal is glasses-free
 stereo 3D on the Leia Lume Pad 2 through the [DisplayXR](https://github.com/DisplayXR) runtime.
 
-## Status: Test 1 (probe)
+## Status: Test 2 (eye offset)
 
-This build doesn't show 3D yet. It checks whether a 3D mod can work on your device:
+Test 1 found Minecraft's code and showed the tablet's GPU can share images with Vulkan. It also
+showed that LeviLauncher can't see the DisplayXR runtime, and that moving the camera position in
+memory doesn't move the picture.
 
-* **A) Hooks:** finds and hooks Minecraft's world-render and camera functions.
-* **B) Camera control:** shifts the camera left/right twice a second, so the world "wobbles".
-* **C) GPU:** reports the OpenGL ES version and whether images can be shared with Vulkan.
-* **D) DisplayXR:** checks whether the DisplayXR runtime and Leia services are visible from inside
-  Minecraft.
-
-Results appear in a black panel at the top left of the screen. Turn the mod off in LeviLauncher's
-mod menu to stop the wobble.
+Test 2 moves the view a different way. It changes the 3D projection matrices that Minecraft sends
+to its OpenGL ES shaders, shifting the eye sideways with an off-axis correction. The world
+should jump left and right twice a second. This is the same per-eye change that real stereo will
+use.
 
 ## Install
 
-1. Download `displayxr3d-0.1.0.levipack` from the [Releases](../../releases) page.
+1. Download the newest `.levipack` from the [Releases](../../releases) page.
 2. In LeviLauncher, import it under Mods and make sure it is turned on.
 3. Start Minecraft through LeviLauncher and open a world.
 
