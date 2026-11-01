@@ -47,7 +47,10 @@ namespace {
 
 constexpr const char *kMinecraftLib = "libminecraftpe.so";
 constexpr const char *kModuleId = "displayxr3d.probe";
-constexpr const char *kVersion = "v0.2.0";
+constexpr const char *kVersion = "v0.3.0";
+JavaVM *g_vm = nullptr;
+std::mutex g_android_mu;
+AndroidReport g_android;
 
 constexpr float kWobbleBlocks = 0.30f;   // eye offset for the wobble demo
 constexpr float kConvergence = 4.0f;     // blocks; this distance stays still
@@ -285,7 +288,7 @@ std::vector<std::string> report_lines(double fps, double proj_s, double comb_s)
 {
 	std::vector<std::string> lines;
 	char buf[300];
-	std::snprintf(buf, sizeof(buf), "DisplayXR 3D - TEST 2 (eye offset)  %s", kVersion);
+	std::snprintf(buf, sizeof(buf), "DisplayXR 3D - TEST 3 (DisplayXR access)  %s", kVersion);
 	lines.emplace_back(buf);
 	std::snprintf(buf, sizeof(buf), "A) GL hooks: program %s  link %s  matrix %s  vec4 %s  clear %s",
 	              g_hooked[0] ? "ok" : "FAIL", g_hooked[1] ? "ok" : "FAIL", g_hooked[2] ? "ok" : "FAIL",
@@ -311,6 +314,23 @@ std::vector<std::string> report_lines(double fps, double proj_s, double comb_s)
 		lines.push_back(names);
 		std::snprintf(buf, sizeof(buf), "   GPU: %.60s", g_gl_version.c_str());
 		lines.emplace_back(buf);
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_android_mu);
+		const AndroidReport &a = g_android;
+		const char *yn[2] = {"no", "YES"};
+		if (!a.done) {
+			lines.emplace_back("D) DisplayXR check: running...");
+		} else {
+			std::snprintf(buf, sizeof(buf), "D) App %s  %s", a.package_name, a.error);
+			lines.emplace_back(buf);
+			std::snprintf(buf, sizeof(buf), "   DisplayXR runtime visible: %s  broker %s  runtime services %d",
+			              yn[a.runtime_out_of_process || a.runtime_in_process], yn[a.broker_provider], a.runtime_services);
+			lines.emplace_back(buf);
+			std::snprintf(buf, sizeof(buf), "   Leia display %s  head tracking %s  camera permission %s",
+			              yn[a.leia_display_config], yn[a.leia_head_tracking], yn[a.perm_camera]);
+			lines.emplace_back(buf);
+		}
 	}
 	lines.emplace_back(g_wobble.load() ? "Wobble ON: the world should jump left/right twice a second"
 	                                   : "Wobble OFF");
@@ -378,6 +398,12 @@ void worker()
 	install_gl_hooks();
 	std::this_thread::sleep_for(std::chrono::seconds(4));
 	register_module();
+	{
+		AndroidReport r;
+		run_android_probe(g_vm, r);
+		std::lock_guard<std::mutex> lock(g_android_mu);
+		g_android = r;
+	}
 
 	uint64_t last_f = g_frames.load(), last_p = g_mod_proj.load(), last_c = g_mod_combined.load();
 	auto last_t = Clock::now();
@@ -409,7 +435,7 @@ void worker()
 
 } // namespace
 
-void probe_load(JavaVM *, const std::filesystem::path &) {}
+void probe_load(JavaVM *vm, const std::filesystem::path &) { g_vm = vm; }
 
 void probe_enable()
 {

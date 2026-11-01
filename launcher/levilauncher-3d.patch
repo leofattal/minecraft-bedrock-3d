@@ -1,0 +1,239 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index ecb3461..eb9caa7 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -39,7 +39,7 @@ android {
+     namespace 'org.levimc.launcher'
+     compileSdkVersion 36
+     defaultConfig {
+-        applicationId "org.levimc.launcher"
++        applicationId "org.levimc.launcher.dxr3d"
+         minSdkVersion 28
+         targetSdkVersion 35
+         versionCode getVersionCodeByTimestamp()
+@@ -77,8 +77,8 @@ android {
+             shrinkResources false
+             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+             firebaseCrashlytics {
+-                mappingFileUploadEnabled true
+-                nativeSymbolUploadEnabled true
++                mappingFileUploadEnabled false
++                nativeSymbolUploadEnabled false
+             }
+             ndk {
+                 debugSymbolLevel 'FULL'
+@@ -91,8 +91,8 @@ android {
+             shrinkResources false
+             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+             firebaseCrashlytics {
+-                mappingFileUploadEnabled true
+-                nativeSymbolUploadEnabled true
++                mappingFileUploadEnabled false
++                nativeSymbolUploadEnabled false
+             }
+             ndk {
+                 debugSymbolLevel 'FULL'
+@@ -105,8 +105,8 @@ android {
+             shrinkResources false
+             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+             firebaseCrashlytics {
+-                mappingFileUploadEnabled true
+-                nativeSymbolUploadEnabled true
++                mappingFileUploadEnabled false
++                nativeSymbolUploadEnabled false
+             }
+             resValue "string", "app_name", "LeviLauncher Beta"
+             buildConfigField "boolean", "IS_BETA", "true"
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 3a4f037..8f6e253 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -30,8 +30,24 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"
+         tools:ignore="RequestInstallPackagesPolicy" />
++    <!-- DisplayXR 3D: camera for the Lume Pad face tracker, and visibility of
++         the DisplayXR OpenXR runtime + Leia services from the game process. -->
++    <uses-permission android:name="android.permission.CAMERA" />
++    <uses-feature android:name="android.hardware.camera" android:required="false" />
++    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+     <queries>
+         <package android:name="com.mojang.minecraftpe" />
++        <intent>
++            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
++        </intent>
++        <provider android:authorities="org.khronos.openxr.runtime_broker" />
++        <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
++        <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
++        <intent>
++            <action android:name="org.freedesktop.monado.ipc.CONNECT" />
++        </intent>
++        <package android:name="com.leialoft.display.config" />
++        <package android:name="com.leia.headtrackingservice" />
+         <intent>
+             <action android:name="android.intent.action.VIEW" />
+             <category android:name="android.intent.category.BROWSABLE" />
+diff --git a/app/src/main/java/org/levimc/launcher/ui/activities/MainActivity.java b/app/src/main/java/org/levimc/launcher/ui/activities/MainActivity.java
+index 161a736..e5be25d 100644
+--- a/app/src/main/java/org/levimc/launcher/ui/activities/MainActivity.java
++++ b/app/src/main/java/org/levimc/launcher/ui/activities/MainActivity.java
+@@ -125,8 +125,11 @@ import okhttp3.OkHttpClient;
+         closeLauncherRestartAfterFirstDraw();
+         setupNavBar();
+         setupManagersAndHandlers();
+-        if (!isInstanceShortcutIntent()) {
+-            new GithubReleaseUpdater(this, "LiteLDev", "LeviLaunchroid", permissionResultLauncher).checkUpdateOnLaunch();
++        // DisplayXR 3D fork: no upstream self-update (it would install the
++        // stock launcher); ask for the camera so the Lume Pad can track eyes.
++        if (checkSelfPermission(android.Manifest.permission.CAMERA)
++                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
++            requestPermissions(new String[]{android.Manifest.permission.CAMERA}, 3301);
+         }
+         showEulaIfNeeded();
+         setupOnBackPressedCallback();
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 143ab0f..02b4417 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">Jugar</string>
+     <string name="beta_badge">Beta</string>
+diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
+index f22d941..b41b5ca 100644
+--- a/app/src/main/res/values-fr/strings.xml
++++ b/app/src/main/res/values-fr/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">Lancer</string>
+     <string name="beta_badge">Bêta</string>
+diff --git a/app/src/main/res/values-hi/strings.xml b/app/src/main/res/values-hi/strings.xml
+index d813a9c..04752e5 100644
+--- a/app/src/main/res/values-hi/strings.xml
++++ b/app/src/main/res/values-hi/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">लॉन्च करें</string>
+     <string name="beta_badge">बीटा</string>
+diff --git a/app/src/main/res/values-idn/strings.xml b/app/src/main/res/values-idn/strings.xml
+index f2c23f4..e77087c 100644
+--- a/app/src/main/res/values-idn/strings.xml
++++ b/app/src/main/res/values-idn/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">Luncurkan</string>
+     <string name="beta_badge">Beta</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index a57dcb1..c400e24 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">起動</string>
+     <string name="beta_badge">ベータ</string>
+diff --git a/app/src/main/res/values-pt/strings.xml b/app/src/main/res/values-pt/strings.xml
+index 7b63cc3..1e79a8c 100644
+--- a/app/src/main/res/values-pt/strings.xml
++++ b/app/src/main/res/values-pt/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">Iniciar</string>
+     <string name="beta_badge">Beta</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 60f0f92..7c50069 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">Запустить</string>
+     <string name="beta_badge">Бета</string>
+diff --git a/app/src/main/res/values-tr/strings.xml b/app/src/main/res/values-tr/strings.xml
+index 1632abf..30022bb 100644
+--- a/app/src/main/res/values-tr/strings.xml
++++ b/app/src/main/res/values-tr/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">Başlat</string>
+     <string name="beta_badge">Beta</string>
+diff --git a/app/src/main/res/values-vi/strings.xml b/app/src/main/res/values-vi/strings.xml
+index a9a66c3..ce7a728 100644
+--- a/app/src/main/res/values-vi/strings.xml
++++ b/app/src/main/res/values-vi/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">Khởi Chạy</string>
+     <string name="beta_badge">Thử Nghiệm</string>
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index a94d76e..af251d0 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">启动</string>
+     <string name="beta_badge">Beta</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 9996c0d..0450442 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -8,7 +8,7 @@
+ 
+ <resources>
+     <!-- Common -->
+-    <string name="app_name">LeviLauncher</string>
++    <string name="app_name">LeviLauncher 3D</string>
+     <string name="minecraft">Minecraft</string>
+     <string name="launch">Launch</string>
+     <string name="beta_badge">Beta</string>
+diff --git a/gradlew b/gradlew
+old mode 100644
+new mode 100755
