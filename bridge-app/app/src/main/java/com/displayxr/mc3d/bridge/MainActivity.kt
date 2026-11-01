@@ -106,7 +106,8 @@ class MainActivity : Activity() {
         cameraBtn.text = if (cameraOk) "2. Camera: allowed ✓" else "2. Allow camera (eye tracking)"
         toggleBtn.text = if (BridgeService.running) "Turn 3D OFF" else "3. Turn 3D ON"
         status.text = if (BridgeService.running) {
-            try { Native.statusText() } catch (t: Throwable) { "starting… ($t)" }
+            (try { Native.statusText() } catch (t: Throwable) { "starting… ($t)" }) +
+                "3D layer over Minecraft: " + (if (BridgeService.overlayAlpha > 0f) "SHOWN" else "hidden") + "\n"
         } else {
             "3D is off."
         }

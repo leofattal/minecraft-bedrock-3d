@@ -38,7 +38,7 @@ namespace {
 
 constexpr const char *kMinecraftLib = "libminecraftpe.so";
 constexpr const char *kModuleId = "displayxr3d.probe";
-constexpr const char *kVersion = "v0.5.0";
+constexpr const char *kVersion = "v0.5.1";
 JavaVM *g_vm = nullptr;
 
 using Clock = std::chrono::steady_clock;

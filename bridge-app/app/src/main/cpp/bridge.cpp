@@ -101,6 +101,8 @@ std::atomic<uint32_t> g_frames_in{0}, g_frames_out{0};
 std::atomic<int> g_buffer_count{0};
 std::atomic<int> g_buf_w{0}, g_buf_h{0};
 std::atomic<int> g_session_state{0};
+std::atomic<uint32_t> g_probe_px[2] = {{0}, {0}};  // centre pixel of the last left/right picture (RGBA)
+std::atomic<bool> g_probe_valid{false};
 
 void set_stage(const char *s) {
   std::lock_guard<std::mutex> l(g_mu);
@@ -137,6 +139,10 @@ uint32_t g_vk_qf = 0;
 VkCommandPool g_pool = VK_NULL_HANDLE;
 VkCommandBuffer g_cmd = VK_NULL_HANDLE;
 VkFence g_fence = VK_NULL_HANDLE;
+VkBuffer g_probe_buf = VK_NULL_HANDLE;  // 2 texels, host-visible: diagnostics
+VkDeviceMemory g_probe_mem = VK_NULL_HANDLE;
+void *g_probe_map = nullptr;
+uint32_t g_probe_tick = 0;
 bool g_have_foreign = false;
 PFN_vkGetAndroidHardwareBufferPropertiesANDROID g_vkGetAhbProps = nullptr;
 
@@ -247,7 +253,7 @@ bool create_instance() {
   XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
   ci.next = &ai;
   strncpy(ci.applicationInfo.applicationName, "DisplayXR 3D Bridge", XR_MAX_APPLICATION_NAME_SIZE - 1);
-  ci.applicationInfo.applicationVersion = 4;
+  ci.applicationInfo.applicationVersion = 5;
   strncpy(ci.applicationInfo.engineName, "Minecraft (displayxr3d)", XR_MAX_ENGINE_NAME_SIZE - 1);
   ci.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
   ci.enabledExtensionCount = (uint32_t)exts.size();
@@ -420,6 +426,28 @@ bool create_vulkan() {
   vkAllocateCommandBuffers(g_vk_device, &cai, &g_cmd);
   VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
   vkCreateFence(g_vk_device, &fci, nullptr, &g_fence);
+
+  VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = 8;
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if (vkCreateBuffer(g_vk_device, &bci, nullptr, &g_probe_buf) == VK_SUCCESS) {
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g_vk_device, g_probe_buf, &mr);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk_phys, &mp);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+      if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) {
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = i;
+        if (vkAllocateMemory(g_vk_device, &mai, nullptr, &g_probe_mem) == VK_SUCCESS &&
+            vkBindBufferMemory(g_vk_device, g_probe_buf, g_probe_mem, 0) == VK_SUCCESS)
+          vkMapMemory(g_vk_device, g_probe_mem, 0, 8, 0, &g_probe_map);
+        break;
+      }
+    }
+  }
   return true;
 }
 
@@ -822,6 +850,7 @@ struct CopyJob {
   VkImage dst;
   uint32_t views, tw, th, cols;
   int src_idx[kMaxViews];
+  bool probe;
 };
 
 void rec_copy(VkCommandBuffer cb, void *user) {
@@ -884,6 +913,28 @@ void rec_copy(VkCommandBuffer cb, void *user) {
     c.extent = {cw, ch, 1};
     vkCmdCopyImage(cb, g_bufs[s].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, job->dst,
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+  }
+
+  // Diagnostics: read back the centre pixel of the left and right pictures.
+  if (job->probe && g_probe_map) {
+    for (uint32_t v = 0; v < 2 && v < job->views; ++v) {
+      const int s = job->src_idx[v];
+      if (s < 0) continue;
+      VkBufferImageCopy bc = {};
+      bc.bufferOffset = v * 4;
+      bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      bc.imageOffset = {(int32_t)(g_bw / 2), (int32_t)(g_bh / 2), 0};
+      bc.imageExtent = {1, 1, 1};
+      vkCmdCopyImageToBuffer(cb, g_bufs[s].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_probe_buf, 1, &bc);
+    }
+    VkBufferMemoryBarrier hb = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    hb.srcQueueFamilyIndex = hb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hb.buffer = g_probe_buf;
+    hb.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hb, 0,
+                         nullptr);
   }
 
   VkImageMemoryBarrier post[kMaxViews + 1];
@@ -967,7 +1018,15 @@ void render_frame() {
         if (l >= (int)g_buf_count) l = -1;
         if (rr >= (int)g_buf_count) rr = -1;
         for (uint32_t v = 0; v < submit; ++v) job.src_idx[v] = (v % 2 == 0) ? l : rr;
+        job.probe = (g_probe_tick++ % 30) == 0;
         one_shot(rec_copy, &job);
+        if (job.probe && g_probe_map) {
+          uint32_t px[2];
+          memcpy(px, g_probe_map, 8);
+          g_probe_px[0] = px[0];
+          g_probe_px[1] = px[1];
+          g_probe_valid = true;
+        }
         XrSwapchainImageReleaseInfo rli = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         r = xrReleaseSwapchainImage(g_swapchain, &rli);
       }
@@ -1022,6 +1081,11 @@ void destroy_all() {
   release_buffers();
   if (g_vk_device) {
     if (g_fence) vkDestroyFence(g_vk_device, g_fence, nullptr);
+    if (g_probe_buf) vkDestroyBuffer(g_vk_device, g_probe_buf, nullptr);
+    if (g_probe_mem) vkFreeMemory(g_vk_device, g_probe_mem, nullptr);
+    g_probe_buf = VK_NULL_HANDLE;
+    g_probe_mem = VK_NULL_HANDLE;
+    g_probe_map = nullptr;
     if (g_pool) vkDestroyCommandPool(g_vk_device, g_pool, nullptr);
     vkDestroyDevice(g_vk_device, nullptr);
   }
@@ -1212,6 +1276,16 @@ JNIEXPORT jstring JNICALL Java_com_displayxr_mc3d_bridge_Native_statusText(JNIEn
   } else {
     snprintf(b, sizeof b, "Minecraft: connected, %d buffers %dx%d\nEye pictures in: %.0f/s   3D frames out: %.0f/s\n",
              g_buffer_count.load(), g_buf_w.load(), g_buf_h.load(), fps_in, fps_out);
+    s += b;
+  }
+  if (g_probe_valid) {
+    auto rgba = [](uint32_t p, char *o, size_t n) {
+      snprintf(o, n, "R%u G%u B%u A%u", p & 255, (p >> 8) & 255, (p >> 16) & 255, p >> 24);
+    };
+    char l[48], r[48];
+    rgba(g_probe_px[0], l, sizeof l);
+    rgba(g_probe_px[1], r, sizeof r);
+    snprintf(b, sizeof b, "Centre pixel  left: %s   right: %s\n", l, r);
     s += b;
   }
   return env->NewStringUTF(s.c_str());

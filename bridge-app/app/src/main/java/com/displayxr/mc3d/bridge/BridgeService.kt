@@ -44,6 +44,7 @@ class BridgeService : Service() {
         const val PROTOCOL_VERSION = 1
         val LAUNCHERS = arrayOf("org.levimc.launcher", "org.levimc.launcher.dxr3d")
         @Volatile var running = false
+        @Volatile var overlayAlpha = 0f
     }
 
     private lateinit var wm: WindowManager
@@ -113,6 +114,7 @@ class BridgeService : Service() {
             val want = if (Native.receiving()) 0.8f else 0f
             if (want != shownAlpha) {
                 shownAlpha = want
+                overlayAlpha = want
                 params?.let {
                     it.alpha = want
                     try { wm.updateViewLayout(overlay, it) } catch (_: Throwable) {}
@@ -163,7 +165,8 @@ class BridgeService : Service() {
 
     private fun addOverlay() {
         val view = SurfaceView(this)
-        view.holder.setFormat(PixelFormat.RGBA_8888)
+        // Opaque: SurfaceFlinger ignores alpha in the woven picture.
+        view.holder.setFormat(PixelFormat.OPAQUE)
         view.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 Native.setSurface(holder.surface)

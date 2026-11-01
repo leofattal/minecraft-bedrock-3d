@@ -243,6 +243,15 @@ void capture_pair_and_blank(int w, int h, int slot_l, int slot_r)
 	copy_to_slot(0, w, h, slot_l);
 	copy_to_slot(stereo_window_twin_fbo(), w, h, slot_r);
 
+	// Force alpha to 1: Minecraft leaves alpha 0 in its window, and a
+	// transparent eye picture would make the woven overlay see-through.
+	glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+	glClearColor(0, 0, 0, 1);
+	for (int slot : {slot_l, slot_r}) {
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_slots[slot].fbo);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
+
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	glClearColor(0, 0, 0, 1);
