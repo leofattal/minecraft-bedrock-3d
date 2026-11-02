@@ -64,7 +64,42 @@ class BridgeService : Service() {
             if (modInfo.isNotEmpty()) {
                 sb.append("— Mod (${(now - modInfoTime) / 1000} s ago) —\n").append(modInfo).append("\n")
             }
+            val logs = synchronized(runtimeLog) { runtimeLog.toList() }
+            if (logs.isNotEmpty()) {
+                sb.append("— DisplayXR warnings (newest last) —\n")
+                for (l in logs) sb.append(l).append("\n")
+            }
             return sb.toString()
+        }
+
+        /** Newest warning/error lines this process logged (DisplayXR runs in-process). */
+        val runtimeLog = ArrayDeque<String>()
+        @Volatile private var logThread: Thread? = null
+
+        /** Apps may read their own process's log without any permission. */
+        fun startLogReader() {
+            if (logThread != null) return
+            val t = Thread {
+                try {
+                    val p = Runtime.getRuntime().exec(arrayOf(
+                        "logcat", "-v", "tag", "--pid=${android.os.Process.myPid()}", "*:W"))
+                    p.inputStream.bufferedReader().forEachLine { raw ->
+                        val line = if (raw.length > 170) raw.substring(0, 170) + "…" else raw
+                        synchronized(runtimeLog) {
+                            if (runtimeLog.lastOrNull() != line) {
+                                runtimeLog.addLast(line)
+                                while (runtimeLog.size > 14) runtimeLog.removeFirst()
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    synchronized(runtimeLog) { runtimeLog.addLast("(could not read log: $t)") }
+                }
+            }
+            t.isDaemon = true
+            t.name = "log-reader"
+            logThread = t
+            t.start()
         }
     }
 
@@ -185,6 +220,7 @@ class BridgeService : Service() {
         running = true
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         startInForeground()
+        startLogReader()
         Native.start(applicationContext)
         addOverlay()
         addStatusBox()
