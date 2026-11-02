@@ -64,6 +64,11 @@ class BridgeService : Service() {
             if (modInfo.isNotEmpty()) {
                 sb.append("— Mod (${(now - modInfoTime) / 1000} s ago) —\n").append(modInfo).append("\n")
             }
+            val keys = synchronized(runtimeLog) { keyLog.toList() }
+            if (keys.isNotEmpty()) {
+                sb.append("— DisplayXR key lines (first ones kept) —\n")
+                for (l in keys) sb.append(l).append("\n")
+            }
             val logs = synchronized(runtimeLog) { runtimeLog.toList() }
             if (logs.isNotEmpty()) {
                 sb.append("— DisplayXR warnings (newest last) —\n")
@@ -74,6 +79,11 @@ class BridgeService : Service() {
 
         /** Newest warning/error lines this process logged (DisplayXR runs in-process). */
         val runtimeLog = ArrayDeque<String>()
+        /** Lines about the 3D processing starting up; kept, never scrolled away. */
+        val keyLog = ArrayList<String>()
+        private val keyWords = Regex(
+            "display processor|factory|looper|leia|cnsdk|interlacer|weaver|SR |E/|F/|fail|error",
+            RegexOption.IGNORE_CASE)
         @Volatile private var logThread: Thread? = null
 
         /** Apps may read their own process's log without any permission. */
@@ -82,13 +92,17 @@ class BridgeService : Service() {
             val t = Thread {
                 try {
                     val p = Runtime.getRuntime().exec(arrayOf(
-                        "logcat", "-v", "tag", "--pid=${android.os.Process.myPid()}", "*:W"))
+                        "logcat", "-v", "tag", "--pid=${android.os.Process.myPid()}", "*:I"))
                     p.inputStream.bufferedReader().forEachLine { raw ->
+                        // Info lines only when they look like 3D start-up news.
+                        if (raw.startsWith("I/") && !keyWords.containsMatchIn(raw)) return@forEachLine
                         val line = if (raw.length > 170) raw.substring(0, 170) + "…" else raw
                         synchronized(runtimeLog) {
+                            if (keyWords.containsMatchIn(raw) && keyLog.size < 16 && !keyLog.contains(line))
+                                keyLog.add(line)
                             if (runtimeLog.lastOrNull() != line) {
                                 runtimeLog.addLast(line)
-                                while (runtimeLog.size > 14) runtimeLog.removeFirst()
+                                while (runtimeLog.size > 8) runtimeLog.removeFirst()
                             }
                         }
                     }
